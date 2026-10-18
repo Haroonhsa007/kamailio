@@ -97,6 +97,7 @@
 
 #include "tcp_info.h"
 #include "tcp_options.h"
+#include "tcp_mtops.h"
 #include "ut.h"
 #include "events.h"
 #include "cfg/cfg_struct.h"
@@ -165,15 +166,15 @@ struct fd_cache_entry
 static struct fd_cache_entry fd_cache[TCP_FD_CACHE_SIZE];
 #endif /* TCP_FD_CACHE */
 
-static int is_tcp_main = 0;
-
+static int _is_tcp_main = 0;
 
 enum poll_types tcp_poll_method = 0; /* by default choose the best method */
 int tcp_main_max_fd_no = 0;
 int tcp_max_connections = DEFAULT_TCP_MAX_CONNECTIONS;
 int tls_max_connections = DEFAULT_TLS_MAX_CONNECTIONS;
 int tcp_accept_unique = 0;
-
+int ksr_tcp_main_threads = 0;
+int ksr_tcp_listen_backlog = TCP_LISTEN_BACKLOG;
 int tcp_connection_match = TCPCONN_MATCH_DEFAULT;
 
 static union sockaddr_union tcp_source_ipv4_addr; /* saved bind/srv v4 addr. */
@@ -248,6 +249,14 @@ static void tcp_log_action(
 			remote_ip, c->rcv.src_port, (reason != NULL) ? reason : "-");
 }
 
+
+/**
+ *
+ */
+int is_tcp_main(void)
+{
+	return _is_tcp_main;
+}
 
 /* sets source address used when opening new sockets and no source is specified
  *  (by default the address is choosen by the kernel)
@@ -722,7 +731,7 @@ inline static int _wbufq_add(
 		q->wr_timeout = get_ticks_raw()
 						+ ((c->state == S_CONN_CONNECT)
 										? S_TO_TICKS(cfg_get(tcp, tcp_cfg,
-												connect_timeout_s))
+												  connect_timeout_s))
 										: cfg_get(tcp, tcp_cfg, send_timeout));
 	} else {
 		wb = q->last;
@@ -1207,7 +1216,17 @@ done:
 		}
 	} while(bytes == -1 && errno == EINTR);
 
-	return (bytes >= 0) ? retval : -1;
+	if(bytes == -1) {
+		LM_ERR("failed to consume PROXY header: %s\n", strerror(errno));
+		return -1;
+	}
+	if(bytes != (int)size) {
+		LM_ERR("short read consuming the PROXY header (%d of %u bytes)\n",
+				bytes, size);
+		return -1;
+	}
+
+	return retval;
 }
 
 int tcp_connection_limit_srcip(union sockaddr_union *srcaddr, int limit)
@@ -1298,6 +1317,7 @@ struct tcp_connection *tcpconn_new(int sock, union sockaddr_union *su,
 	c->initstate = state;
 	c->extra_data = 0;
 	c->timestamp = time(NULL);
+	c->lifetime = cfg_get(tcp, tcp_cfg, con_lifetime);
 #ifdef USE_TLS
 	if(type == PROTO_TLS) {
 		if(tls_tcpconn_init(c, sock) == -1)
@@ -1307,8 +1327,7 @@ struct tcp_connection *tcpconn_new(int sock, union sockaddr_union *su,
 	{
 		c->type = PROTO_TCP;
 		c->rcv.proto = PROTO_TCP;
-		c->timeout = get_ticks_raw() + cfg_get(tcp, tcp_cfg, con_lifetime);
-		c->lifetime = cfg_get(tcp, tcp_cfg, con_lifetime);
+		c->timeout = get_ticks_raw() + c->lifetime;
 	}
 
 	return c;
@@ -1802,11 +1821,66 @@ struct tcp_connection *_tcpconn_find(int id, struct ip_addr *ip, int port,
 					&& (proto == PROTO_NONE || a->parent->rcv.proto == proto)) {
 				LM_DBG("found connection by peer address (id: %d)\n",
 						a->parent->id);
+
+#ifdef USE_TLS
+				if(tls_connection_match_domain && a->parent->type == PROTO_TLS
+						&& !tls_hook_call(match_domain, 1, a->parent, ip, port))
+					continue;
+#endif
 				return a->parent;
 			}
 		}
 	}
 	return 0;
+}
+
+/* fallback matcher for cases where the generic wildcard-local alias
+ * could not be installed due to alias collisions; it scans existing
+ * connections for the same peer tuple regardless of local binding
+ * params:
+ *   ip - peer ip address to match (must not be NULL)
+ *   port - peer port to match (host byte order)
+ *   proto - protocol to match, PROTO_NONE for any protocol
+ * return:
+ *   matching tcp connection pointer if found, NULL otherwise
+ */
+static struct tcp_connection *_tcpconn_find_any_local(
+		struct ip_addr *ip, int port, sip_protos_t proto)
+{
+	struct tcp_connection *c;
+	int i;
+
+	if(ip == NULL) {
+		return NULL;
+	}
+
+	for(i = 0; i < TCP_ID_HASH_SIZE; i++) {
+		for(c = tcpconn_id_hash[i]; c; c = c->id_next) {
+			if(c->state == S_CONN_BAD) {
+				continue;
+			}
+			if(c->rcv.src_port != port) {
+				continue;
+			}
+			if(!ip_addr_cmp(ip, &c->rcv.src_ip)) {
+				continue;
+			}
+			if(proto != PROTO_NONE && c->rcv.proto != proto) {
+				continue;
+			}
+#ifdef USE_TLS
+			if(tls_connection_match_domain && c->type == PROTO_TLS
+					&& !tls_hook_call(match_domain, 1, c, ip, port)) {
+				continue;
+			}
+#endif
+			LM_DBG("found connection by peer address fallback (id: %d)\n",
+					c->id);
+			return c;
+		}
+	}
+
+	return NULL;
 }
 
 
@@ -1861,6 +1935,10 @@ struct tcp_connection *tcpconn_lookup(int id, struct ip_addr *ip, int port,
 	}
 	if(unlikely(c == NULL)) {
 		c = _tcpconn_find(id, ip, port, &local_ip, local_port, proto);
+	}
+	if(unlikely(c == NULL) && likely(id == 0 && ip != NULL)
+			&& likely(local_port == 0)) {
+		c = _tcpconn_find_any_local(ip, port, proto);
 	}
 	if(likely(c)) {
 		atomic_inc(&c->refcnt);
@@ -1921,6 +1999,14 @@ inline static int _tcpconn_add_alias_unsafe(struct tcp_connection *c, int port,
 							|| ip_addr_cmp(&a->parent->rcv.dst_ip, l_ip))) {
 				/* found */
 				if(unlikely(a->parent != c)) {
+#ifdef USE_TLS
+					if(tls_connection_match_domain && c->type == PROTO_TLS
+							&& a->parent->type == PROTO_TLS
+							&& !tls_hook_call(
+									match_connections_domain, 1, c, a->parent))
+						continue;
+#endif
+
 					if(flags & TCP_ALIAS_FORCE_ADD)
 						/* still have to walk the whole list to check if
 						 * the alias was not already added */
@@ -3266,6 +3352,23 @@ int tcp_init(struct socket_info *sock_info)
 	}
 #endif
 
+#if defined(__OS_linux)
+	if(sock_info->vrfinfo.name.s != NULL && sock_info->vrfinfo.name.len > 0) {
+		if(setsockopt(sock_info->socket, SOL_SOCKET, SO_BINDTODEVICE,
+				   sock_info->vrfinfo.name.s, sock_info->vrfinfo.name.len)
+				== -1) {
+			LM_ERR("setsockopt SO_BINDTODEVICE on %.*s failed: %s\n",
+					STR_FMT(&sock_info->vrfinfo.name), strerror(errno));
+			goto error;
+		}
+	}
+#else
+	if(sock_info->vrfinfo.name.s != NULL && sock_info->vrfinfo.name.len > 0) {
+		LM_WARN("VRF only supported on linux, skip SO_BINDTODEVICE for %.*s\n",
+				STR_FMT(&sock_info->vrfinfo.name));
+	}
+#endif
+
 	/* tos */
 	optval = tos;
 	if(sock_info->address.af == AF_INET) {
@@ -3358,7 +3461,7 @@ int tcp_init(struct socket_info *sock_info)
 		}
 		goto error;
 	}
-	if(listen(sock_info->socket, TCP_LISTEN_BACKLOG) == -1) {
+	if(listen(sock_info->socket, ksr_tcp_listen_backlog) == -1) {
 		LM_ERR("listen(%x, %p, %d) on %s: %s\n", sock_info->socket, &addr->s,
 				(unsigned)sockaddru_len(*addr), sock_info->address_str.s,
 				strerror(errno));
@@ -4538,6 +4641,8 @@ static inline int handle_new_connect(struct socket_info *si)
 	union sockaddr_union *dst_su;
 	struct tcp_connection *tcpconn;
 	socklen_t su_len;
+	ticks_t crt_timeout;
+	ticks_t t;
 	int new_sock;
 
 	/* got a connection on r */
@@ -4622,9 +4727,12 @@ static inline int handle_new_connect(struct socket_info *si)
 		atomic_set(&tcpconn->refcnt, 1); /* safe, not yet available to the
 											outside world */
 		tcpconn_add(tcpconn);
-		/* activate the timer */
-		local_timer_add(&tcp_main_ltimer, &tcpconn->timer,
-				cfg_get(tcp, tcp_cfg, con_lifetime), get_ticks_raw());
+		/* activate the protocol-specific initial timer
+		 * - TLS may use a shorter deadline (i.e., tls/connection_timeout) until
+		 *   the first I/O event than the recurring core TCP lifetime */
+		t = get_ticks_raw();
+		crt_timeout = TICKS_LT(t, tcpconn->timeout) ? tcpconn->timeout - t : 1;
+		local_timer_add(&tcp_main_ltimer, &tcpconn->timer, crt_timeout, t);
 		tcpconn->flags |= (F_CONN_MAIN_TIMER | F_CONN_READ_W | F_CONN_WANTS_RD);
 		if(unlikely(io_watch_add(&io_h, tcpconn->s, POLLIN, F_TCPCONN, tcpconn)
 					< 0)) {
@@ -4992,7 +5100,7 @@ static inline void tcpconn_destroy_all(void)
 		c = tcpconn_id_hash[h];
 		while(c) {
 			next = c->id_next;
-			if(is_tcp_main) {
+			if(_is_tcp_main) {
 				/* we cannot close or remove the fd if we are not in the
 					 * tcp main proc.*/
 				if((c->flags & F_CONN_MAIN_TIMER)) {
@@ -5037,7 +5145,7 @@ void tcp_main_loop()
 	struct socket_info *si;
 	int r;
 
-	is_tcp_main = 1; /* mark this process as tcp main */
+	_is_tcp_main = 1; /* mark this process as tcp main */
 
 	tcp_main_max_fd_no = get_max_open_fds();
 	/* init send fd queues (here because we want mem. alloc only in the tcp
@@ -5064,6 +5172,16 @@ void tcp_main_loop()
 	if(cfg_get(tcp, tcp_cfg, fd_cache))
 		tcp_fd_cache_init();
 #endif /* TCP_FD_CACHE */
+
+	if(ksr_tcp_main_threads != 0) {
+		if(ksr_tcpx_proc_list_prepare() < 0) {
+			LM_ERR("failed to prepare multi-thread processing list\n");
+			goto error;
+		}
+		LM_INFO("tcp main processing threads prepared\n");
+	} else {
+		LM_INFO("tcp main processing threads not enabled\n");
+	}
 
 	/* add all the sockets we listen on for connections */
 	for(si = tcp_listen; si; si = si->next) {

@@ -128,6 +128,7 @@ static int T_branch = 0;
  */
 msg_ctx_id_t tm_global_ctx_id = {0};
 
+extern int _tm_reply_matching;
 
 struct cell *get_t()
 {
@@ -642,7 +643,7 @@ int t_request_search(struct sip_msg *p_msg, struct cell **r_cell)
 			/* request matched ! */
 			LM_DBG("non-ACK matched\n");
 			goto found;
-		}	 /* synonym loop */
+		} /* synonym loop */
 	} else { /* it's an ACK request*/
 		/* all the transactions from the entry are compared */
 		clist_foreach(hash_bucket, p_cell, next_c)
@@ -730,7 +731,7 @@ int t_request_search(struct sip_msg *p_msg, struct cell **r_cell)
 			LM_DBG("non-2xx ACK matched\n");
 			goto found;
 		} /* synonym loop */
-	}	  /* ACK */
+	} /* ACK */
 
 notfound:
 
@@ -890,7 +891,7 @@ int t_lookup_request(struct sip_msg *p_msg, int leave_new_locked, int *cancel)
 			/* request matched ! */
 			LM_DBG("non-ACK matched\n");
 			goto found;
-		}	 /* synonym loop */
+		} /* synonym loop */
 	} else { /* it's an ACK request*/
 		/* all the transactions from the entry are compared */
 		clist_foreach(hash_bucket, p_cell, next_c)
@@ -978,7 +979,7 @@ int t_lookup_request(struct sip_msg *p_msg, int leave_new_locked, int *cancel)
 			LM_DBG("non-2xx ACK matched\n");
 			goto found;
 		} /* synonym loop */
-	}	  /* ACK */
+	} /* ACK */
 
 notfound:
 
@@ -1361,6 +1362,8 @@ int t_reply_matching(struct sip_msg *p_msg, int *p_branch)
 	int loopl;
 
 	short is_cancel;
+	short is_local_cancel;
+	short is_cinv_rpl; /* 1xx or negative final reply to a canceled INVITE */
 
 	/* make compiler warnings happy */
 	loopi = 0;
@@ -1467,6 +1470,16 @@ int t_reply_matching(struct sip_msg *p_msg, int *p_branch)
 		if(unlikely(branch_id >= p_cell->nr_of_outgoings))
 			continue;
 
+		is_local_cancel = is_cancel && is_invite(p_cell)
+						  && p_cell->uac[branch_id].local_cancel.buffer_len;
+		is_cinv_rpl =
+				is_invite(p_cell) && cseq_method.len == INVITE_LEN
+				&& memcmp(cseq_method.s, INVITE, INVITE_LEN) == 0
+				&& ((p_msg->REPLY_STATUS >= 100 && p_msg->REPLY_STATUS < 200)
+						|| (p_msg->REPLY_STATUS >= 300
+								&& p_msg->REPLY_STATUS < 700))
+				&& (p_cell->uac[branch_id].request.flags & F_RB_CANCELED);
+
 		/* does method match ? (remember -- CANCELs have the same branch
 		 * as canceled transactions) */
 		req_method = p_cell->method;
@@ -1476,15 +1489,7 @@ int t_reply_matching(struct sip_msg *p_msg, int *p_branch)
 									 cseq_method.len)
 									 == 0)
 						/* or it is a local cancel */
-						|| (is_cancel
-								&& is_invite(p_cell)
-								/* commented out -- should_cancel_branch set it to
-						 * BUSY_BUFFER to avoid collisions with replies;
-						 * thus, we test here by buffer size
-						 */
-								/* && p_cell->uac[branch_id].local_cancel.buffer ))) */
-								&& p_cell->uac[branch_id]
-										   .local_cancel.buffer_len)))
+						|| is_local_cancel))
 			continue;
 
 		if(cfg_get(tm, tm_cfg, callid_matching) && p_cell->uas.request
@@ -1503,12 +1508,26 @@ int t_reply_matching(struct sip_msg *p_msg, int *p_branch)
 			continue;
 		}
 
+		if(_tm_reply_matching & TM_REPLY_MATCHING_ACTIVE) {
+			/* Replies for a local CANCEL, and INVITE replies needed to send a
+			 * deferred branch CANCEL or ACK its negative final response, can
+			 * arrive after the INVITE is in WAIT. */
+			if(unlikely((p_cell->flags & T_IN_AGONY)
+						|| (t_on_wait(p_cell) && !is_local_cancel
+								&& !is_cinv_rpl))) {
+				LM_INFO("skipping late reply match for transaction already in "
+						"terminated phase: T=%p wait=%d flags=0x%x\n",
+						p_cell, t_on_wait(p_cell), p_cell->flags);
+				continue;
+			}
+		}
+
 		/* passed all disqualifying factors - the transaction has been matched */
 		set_t(p_cell, (int)branch_id);
 		*p_branch = (int)branch_id;
 		REF_UNSAFE(T);
 		UNLOCK_HASH(hash_index);
-		LM_DBG("reply (%p) matched an active transaction (T=%p)!\n", p_msg, T);
+		LM_DBG("reply (%p) matched a valid transaction (T=%p)!\n", p_msg, T);
 		if(likely(!(p_msg->msg_flags & FL_TM_RPL_MATCHED))) {
 			/* if this is a 200 for INVITE, we will wish to store to-tags to be
 			 * able to distinguish retransmissions later and not to call
@@ -1830,6 +1849,21 @@ static inline void init_new_t(struct cell *new_cell, struct sip_msg *p_msg)
 static inline int new_t(struct sip_msg *p_msg)
 {
 	struct cell *new_cell;
+
+	if((ksr_msg_apply_changes_mode == 1)
+			|| (p_msg->msg_flags & FL_MSG_APPLY_CHANGES)) {
+		if(sip_msg_apply_changes(p_msg) < 0) {
+			return E_BAD_REQ;
+		}
+		if(parse_headers(p_msg, HDR_EOH_F, 0)) {
+			LM_ERR("parse_headers failed\n");
+			return E_BAD_REQ;
+		}
+		if((p_msg->parsed_flag & HDR_EOH_F) != HDR_EOH_F) {
+			LM_ERR("EoH not parsed\n");
+			return E_UNEXPECTED_STATE;
+		}
+	}
 
 	/* for ACK-dlw-wise matching, we want From-tags */
 	if(p_msg->REQ_METHOD == METHOD_INVITE && parse_from_header(p_msg) < 0) {

@@ -218,6 +218,8 @@ static str *tls_get_connect_server_name(void)
 static int tls_complete_init(struct tcp_connection *c)
 {
 	tls_domain_t *dom;
+	char *dom_str;
+	size_t dom_str_size;
 	struct tls_extra_data *data = 0;
 	tls_domains_cfg_t *cfg;
 	enum tls_conn_states state;
@@ -262,7 +264,11 @@ static int tls_complete_init(struct tcp_connection *c)
 	DBG("Using initial TLS domain %s (dom %p ctx %p sn [%s])\n",
 			tls_domain_str(dom), dom, dom->ctx[0], ZSW(dom->server_name.s));
 
-	data = (struct tls_extra_data *)shm_malloc(sizeof(struct tls_extra_data));
+	dom_str = tls_domain_str(dom);
+	dom_str_size = strlen(dom_str) + 1;
+
+	data = (struct tls_extra_data *)shm_malloc(
+			sizeof(struct tls_extra_data) + dom_str_size);
 	if(!data) {
 		ERR("Not enough shared memory left\n");
 		goto error;
@@ -274,6 +280,9 @@ static int tls_complete_init(struct tcp_connection *c)
 	data->rwbio = rw_bio;
 	data->cfg = cfg;
 	data->state = state;
+	data->dom.s = (char *)data + sizeof(struct tls_extra_data);
+	data->dom.len = dom_str_size - 1;
+	memcpy(data->dom.s, dom_str, dom_str_size);
 
 	if(unlikely(data->ssl == 0 || data->rwbio == 0)) {
 		TLS_ERR_SSL("Failed to create SSL or BIO structure:", data->ssl);
@@ -600,7 +609,6 @@ int tls_h_tcpconn_init_f(struct tcp_connection *c, int sock)
 	c->type = PROTO_TLS;
 	c->rcv.proto = PROTO_TLS;
 	c->timeout = get_ticks_raw() + cfg_get(tls, tls_cfg, con_lifetime);
-	c->lifetime = cfg_get(tls, tls_cfg, con_lifetime);
 	c->extra_data = 0;
 	return 0;
 }
@@ -690,6 +698,89 @@ void tls_h_tcpconn_close_f(struct tcp_connection *c, int fd)
 
 		lock_release(&c->write_lock);
 	}
+}
+
+
+static char *get_tls_domain_str(
+		struct tcp_connection *c, struct ip_addr *ip, unsigned short port)
+{
+	tls_domain_t *dom;
+	char *dom_str;
+	tls_domains_cfg_t *cfg;
+	str *sname = NULL;
+	str *srvid = NULL;
+
+	lock_get(tls_domains_cfg_lock);
+	cfg = *tls_domains_cfg;
+	atomic_inc(&cfg->ref_count);
+	lock_release(tls_domains_cfg_lock);
+
+	if(c && (c->flags & F_CONN_PASSIVE)) {
+		dom = tls_lookup_cfg(cfg, TLS_DOMAIN_SRV, ip, port, 0, 0);
+	} else {
+		sname = tls_get_connect_server_name();
+		srvid = tls_get_connect_server_id();
+		dom = tls_lookup_cfg(cfg, TLS_DOMAIN_CLI, ip, port, sname, srvid);
+	}
+
+	dom_str = tls_domain_str(dom);
+	atomic_dec(&cfg->ref_count);
+
+	return dom_str;
+}
+
+
+int tls_h_match_domain_f(
+		struct tcp_connection *c, struct ip_addr *ip, unsigned short port)
+{
+	struct tls_extra_data *tls_c;
+	char *dom_str;
+	str dom;
+
+	if(c->type != PROTO_TLS) {
+		LM_ERR("Connection is not TLS\n");
+		return 0;
+	}
+
+	tls_c = (struct tls_extra_data *)c->extra_data;
+
+	if(!c->extra_data) {
+		LM_ERR("called before tls_complete_init()\n");
+		return 0;
+	}
+
+	dom_str = get_tls_domain_str(NULL /* to use XAVPs only */, ip, port);
+	STR_SET(dom, dom_str);
+
+	return STR_EQ(tls_c->dom, dom);
+}
+
+
+int tls_h_match_connections_domain_f(
+		struct tcp_connection *l_c, struct tcp_connection *r_c)
+{
+	struct tls_extra_data *l_tls_c, *r_tls_c;
+	char *l_dom_str;
+	str l_dom;
+
+	l_tls_c = (struct tls_extra_data *)l_c->extra_data;
+	r_tls_c = (struct tls_extra_data *)r_c->extra_data;
+
+	if(!r_tls_c)
+		return 1; //consider connection wihout extra_data as matched to keep old behavior
+
+	if(l_tls_c)
+		return STR_EQ(l_tls_c->dom, r_tls_c->dom);
+
+	if(l_c->type != PROTO_TLS) {
+		LM_ERR("Connection is not TLS\n");
+		return 0;
+	}
+
+	l_dom_str = get_tls_domain_str(l_c, &l_c->rcv.dst_ip, l_c->rcv.dst_port);
+	STR_SET(l_dom, l_dom_str);
+
+	return STR_EQ(l_dom, r_tls_c->dom);
 }
 
 
@@ -1005,7 +1096,7 @@ int tls_h_read_f(struct tcp_connection *c, rd_conn_flags_t *flags)
 	WOLFSSL_BIO *rwbio;
 	unsigned char rd_buf[TLS_RD_MBUF_SZ];
 	unsigned char wr_buf[TLS_WR_MBUF_SZ];
-	size_t wr_used, rd_unused;
+	size_t wr_used, rd_unused, rd_pending;
 	size_t nr, npos, nw;
 	struct tls_extra_data *tls_c;
 	int n, flush_flags;
@@ -1043,9 +1134,12 @@ redo_read:
 	/* real read() */
 	/* read() only if no previously detected EOF, or previous
      * short read (which means the socket buffer was emptied) */
-	if(likely(!(*flags & (RD_CONN_EOF | RD_CONN_SHORT_READ)))) {
-		/* don't read more than the free bytes in the tcp req buffer */
-		read_size = MIN_unsigned(TLS_RD_MBUF_SZ, bytes_free);
+	/* ciphertext left unread in the rd BIO when the tcp req buffer filled */
+	rd_pending = wolfSSL_BIO_ctrl_pending(wolfSSL_SSL_get_rbio(tls_c->ssl));
+	if(likely(!(*flags & (RD_CONN_EOF | RD_CONN_SHORT_READ))
+			   && rd_pending < TLS_RD_MBUF_SZ)) {
+		/* don't read more than the free bytes in the tcp req buffer or BIO */
+		read_size = MIN_unsigned(TLS_RD_MBUF_SZ - rd_pending, bytes_free);
 		bytes_read = tcp_read_data(c->fd, c, (char *)rd_buf, read_size, flags);
 		TLS_RD_TRACE("(%p, %p) tcp_read_data(..., %d, *%d) => %d bytes\n", c,
 				flags, read_size, *flags, bytes_read);

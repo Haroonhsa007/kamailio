@@ -212,7 +212,6 @@ int bla_handle_notify(struct sip_msg *msg, char *s1, char *s2)
 	}
 
 	xmlCleanupParser();
-	xmlMemoryDump();
 
 	free_to_params(&TO);
 	return 1;

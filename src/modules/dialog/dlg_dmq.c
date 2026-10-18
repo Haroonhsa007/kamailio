@@ -33,7 +33,6 @@ static str dmq_500_rpl = str_init("Server Internal Error");
 
 dmq_api_t dlg_dmqb;
 dmq_peer_t *dlg_dmq_peer = NULL;
-dmq_resp_cback_t dlg_dmq_resp_callback = {&dlg_dmq_resp_callback_f, 0};
 
 int dmq_send_all_dlgs(dmq_node_t *dmq_node);
 int dlg_dmq_request_sync();
@@ -82,12 +81,12 @@ int dlg_dmq_send(str *body, dmq_node_t *node)
 	}
 	if(node) {
 		LM_DBG("sending dmq message ...\n");
-		dlg_dmqb.send_message(dlg_dmq_peer, body, node, &dlg_dmq_resp_callback,
-				1, &dlg_dmq_content_type);
+		dlg_dmqb.send_message(
+				dlg_dmq_peer, body, node, NULL, 1, &dlg_dmq_content_type);
 	} else {
 		LM_DBG("sending dmq broadcast...\n");
-		dlg_dmqb.bcast_message(dlg_dmq_peer, body, 0, &dlg_dmq_resp_callback, 1,
-				&dlg_dmq_content_type);
+		dlg_dmqb.bcast_message(
+				dlg_dmq_peer, body, 0, NULL, 1, &dlg_dmq_content_type);
 	}
 	return 0;
 }
@@ -265,6 +264,9 @@ int dlg_dmq_handle_msg(
 
 			dlg->init_ts = init_ts;
 			dlg->start_ts = start_ts;
+			/* lifetime from UPDATE, needed for UNCONFIRMED state of the dialog */
+			if(lifetime > 0)
+				dlg->lifetime = lifetime;
 
 			vj = srjson_GetObjectItem(&jdoc, jdoc.root, "vars");
 			if(vj != NULL) {
@@ -307,27 +309,39 @@ int dlg_dmq_handle_msg(
 			switch(state) {
 				case DLG_STATE_EARLY:
 					dlg->start_ts = start_ts;
-					dlg->lifetime = lifetime;
-					dlg_set_leg_info(
-							dlg, &tag1, &route_set1, &contact1, &cseq1, 0);
+					if(lifetime > 0)
+						dlg->lifetime = lifetime;
+					/* apply leg info if it carries data */
+					if(tag1.len > 0) {
+						dlg_set_leg_info(
+								dlg, &tag1, &route_set1, &contact1, &cseq1, 0);
+					}
 					break;
 				case DLG_STATE_CONFIRMED:
 					dlg->start_ts = start_ts;
-					dlg->lifetime = lifetime;
-					dlg_set_leg_info(
-							dlg, &tag1, &route_set1, &contact1, &cseq1, 0);
-					dlg_set_leg_info(
-							dlg, &tag2, &route_set2, &contact2, &cseq2, 1);
-					if(insert_dlg_timer(&dlg->tl, dlg->lifetime) != 0) {
+					if(lifetime > 0)
+						dlg->lifetime = lifetime;
+					/* apply leg info if it carries data */
+					if(tag1.len > 0) {
+						dlg_set_leg_info(
+								dlg, &tag1, &route_set1, &contact1, &cseq1, 0);
+					}
+					if(tag2.len > 0) {
+						dlg_set_leg_info(
+								dlg, &tag2, &route_set2, &contact2, &cseq2, 1);
+					}
+					ret = insert_dlg_timer(&dlg->tl, dlg->lifetime);
+					if(ret < 0) {
 						LM_CRIT("Unable to insert dlg timer %p [%u:%u]\n", dlg,
 								dlg->h_entry, dlg->h_id);
-					} else {
+					} else if(ret == 0) {
 						/* dialog pointer inserted in timer list */
 						dlg_ref(dlg, 1);
 					}
 					break;
 				case DLG_STATE_DELETED:
-					if(dlg->state == DLG_STATE_CONFIRMED) {
+					if(dlg->state == DLG_STATE_CONFIRMED_NA
+							|| dlg->state == DLG_STATE_CONFIRMED) {
 						ret = remove_dialog_timer(&dlg->tl);
 						if(ret == 0) {
 							/* one extra unref due to removal from timer list */
@@ -347,21 +361,41 @@ int dlg_dmq_handle_msg(
 
 					/* prevent DB sync */
 					dlg->dflags |= DLG_FLAG_NEW;
+					/* mark as deleted by a dmq peer */
+					dlg->dflags |= DLG_FLAG_DMQ_DELETED;
 					/* keep dialog around for a bit, to prevent out-of-order
 					 * syncs to reestablish the dlg */
-					dlg->init_ts = time(NULL);
+					dlg->init_ts = ksr_time_uint(NULL, NULL);
+					/* ensure end_ts is set so dlg_clean_run can clean the dialog */
+					if(dlg->end_ts == 0)
+						dlg->end_ts = ksr_time_uint(NULL, NULL);
+
+					if(dlg->state != DLG_STATE_DELETED) {
+						run_dlg_callbacks(DLGCB_TERMINATED, dlg, NULL, NULL,
+								DLG_DIR_NONE, 0);
+					}
+
 					break;
 				default:
 					LM_ERR("unhandled state update to state %u\n", state);
 					dlg_unref(dlg, unref);
 					goto error;
 			}
-			if(newdlg == 1) {
-				if(state == DLG_STATE_CONFIRMED_NA
-						|| state == DLG_STATE_CONFIRMED) {
-					if_update_stat(dlg_enable_stats, active_dlgs, 1);
-				} else if(dlg->state == DLG_STATE_EARLY) {
+			/* update node-local stats for the dlg dmq synced state transition */
+			if(dlg->state != state) {
+				if(dlg->state == DLG_STATE_EARLY) {
+					if_update_stat(dlg_enable_stats, early_dlgs, -1);
+				}
+				if(state == DLG_STATE_EARLY) {
 					if_update_stat(dlg_enable_stats, early_dlgs, 1);
+				} else if((state == DLG_STATE_CONFIRMED_NA
+								  || state == DLG_STATE_CONFIRMED)
+						  && dlg->state < DLG_STATE_CONFIRMED_NA) {
+					if_update_stat(dlg_enable_stats, active_dlgs, 1);
+				} else if(state == DLG_STATE_DELETED
+						  && (dlg->state == DLG_STATE_CONFIRMED_NA
+								  || dlg->state == DLG_STATE_CONFIRMED)) {
+					if_update_stat(dlg_enable_stats, active_dlgs, -1);
 				}
 			}
 			dlg->state = state;
@@ -375,7 +409,8 @@ int dlg_dmq_handle_msg(
 			LM_DBG("Removed dlg [%u:%u] with callid [%.*s] int state [%u]\n",
 					iuid.h_entry, iuid.h_id, dlg->callid.len, dlg->callid.s,
 					dlg->state);
-			if(dlg->state == DLG_STATE_CONFIRMED
+			if(dlg->state == DLG_STATE_CONFIRMED_NA
+					|| dlg->state == DLG_STATE_CONFIRMED
 					|| dlg->state == DLG_STATE_EARLY) {
 				ret = remove_dialog_timer(&dlg->tl);
 				if(ret == 0) {
@@ -386,8 +421,9 @@ int dlg_dmq_handle_msg(
 							dlg, dlg->h_entry, dlg->h_id);
 				}
 			}
-			if(state == DLG_STATE_CONFIRMED_NA
-					|| state == DLG_STATE_CONFIRMED) {
+			/* update node-local stats for the dlg dmq synced removal */
+			if(dlg->state == DLG_STATE_CONFIRMED_NA
+					|| dlg->state == DLG_STATE_CONFIRMED) {
 				if_update_stat(dlg_enable_stats, active_dlgs, -1);
 			} else if(dlg->state == DLG_STATE_EARLY) {
 				if_update_stat(dlg_enable_stats, early_dlgs, -1);
@@ -395,6 +431,15 @@ int dlg_dmq_handle_msg(
 			/* prevent DB sync */
 			dlg->dflags |= DLG_FLAG_NEW;
 			dlg->iflags &= ~DLG_IFLAG_DMQ_SYNC;
+			/* mark as deleted by a dmq peer */
+			dlg->dflags |= DLG_FLAG_DMQ_DELETED;
+
+			/* mark deleted if not already marked */
+			if(dlg->state != DLG_STATE_DELETED) {
+				dlg->state = DLG_STATE_DELETED;
+				if(dlg->end_ts == 0)
+					dlg->end_ts = ksr_time_uint(NULL, NULL);
+			}
 			unref++;
 			break;
 
@@ -619,6 +664,9 @@ int dlg_dmq_replicate_action(dlg_dmq_action_t action, dlg_cell_t *dlg,
 					//dlg->iflags &= ~DLG_IFLAG_DMQ_SYNC;
 					break;
 				default:
+					/* lifetime on UPDATE fallthrough */
+					srjson_AddNumberToObject(
+							&jdoc, jdoc.root, "lifetime", dlg->lifetime);
 					LM_DBG("not syncing state %u\n", dlg->state);
 			}
 			break;
@@ -682,16 +730,5 @@ int dmq_send_all_dlgs(dmq_node_t *dmq_node)
 		dlg_unlock(d_table, entry);
 	}
 
-	return 0;
-}
-
-
-/**
-* @brief dmq response callback
-*/
-int dlg_dmq_resp_callback_f(
-		struct sip_msg *msg, int code, dmq_node_t *node, void *param)
-{
-	LM_DBG("dmq response callback triggered [%p %d %p]\n", msg, code, param);
 	return 0;
 }

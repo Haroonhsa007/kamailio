@@ -177,7 +177,7 @@ static int fill_contact(
 	char *srcip = NULL;
 	str aor = STR_NULL;
 	sip_msg_t tmsg;
-	char tbuf[BUF_SIZE];
+	char tbuf[BUF_SIZE + 1];
 	int i;
 
 	if(!ci) {
@@ -332,23 +332,37 @@ static int fill_contact(
 			LM_ERR("buffer parsing failed!");
 			goto error;
 		}
-		cb = cscf_parse_contacts(&tmsg);
-		if(!cb || (!cb->contacts)) {
-			LM_ERR("Reply No contact headers\n");
-			free_sip_msg(&tmsg);
-			goto error;
-		}
-		if(pkg_str_dup(&aor, &cb->contacts->uri) < 0) {
-			LM_ERR("failed to duplicate aor\n");
-			free_sip_msg(&tmsg);
-			goto error;
-		}
-		free_sip_msg(&tmsg);
-
-		vb = cscf_get_ue_via(m);
-		if(!vb) {
+		if((vb = cscf_get_ue_via(m)) == NULL) {
 			LM_ERR("Reply No via body headers\n");
-			return -1;
+			free_sip_msg(&tmsg);
+			goto error;
+		}
+		cb = cscf_parse_contacts(&tmsg);
+		free_sip_msg(&tmsg);
+		if(!cb || (!cb->contacts)) {
+			LM_DBG("Reply No contact headers, building AOR from Via\n");
+			// Handle the messages without contacts (e.g.BYE)
+			// Build AOR as "sip:<via_host>:<via_port>"
+			char aor_buf[256];
+			int aor_len = snprintf(aor_buf, sizeof(aor_buf), "sip:%.*s:%d",
+					vb->host.len, vb->host.s, vb->port);
+			if(aor_len <= 0 || aor_len >= (int)sizeof(aor_buf)) {
+				LM_ERR("Failed to build AOR from Via\n");
+				goto error;
+			}
+			if((aor.s = pkg_malloc(aor_len)) == NULL) {
+				PKG_MEM_ERROR;
+				goto error;
+			}
+			memcpy(aor.s, aor_buf, aor_len);
+			aor.len = aor_len;
+			LM_DBG("set AOR [%.*s], VIA [%d://%.*s:%d]\n", STR_FMT(&aor),
+					vb->proto, STR_FMT(&vb->host), vb->port);
+		} else {
+			if(pkg_str_dup(&aor, &cb->contacts->uri) < 0) {
+				LM_ERR("failed to duplicate aor\n");
+				goto error;
+			}
 		}
 
 		// populate CI with bare minimum
@@ -358,8 +372,8 @@ static int fill_contact(
 		ci->searchflag = SEARCH_RECEIVED;
 
 		if((srcip = pkg_malloc(50)) == NULL) {
-			LM_ERR("Error allocating memory for source IP address\n");
-			return -1;
+			PKG_MEM_ERROR;
+			goto error;
 		}
 
 		ci->received_host.len =
@@ -422,7 +436,7 @@ static int get_ck_ik(const struct sip_msg *m, str *ck, str *ik)
 	}
 
 	*ik = get_www_auth_param("ik", www_auth);
-	if(ck->len == 0) {
+	if(ik->len == 0) {
 		LM_ERR("Error getting IK\n");
 		return -1;
 	}
@@ -463,8 +477,7 @@ static int update_contact_ipsec_params(
 
 	// Reuse only if both CK and IK match.
 	if(s_old && s_old->ck.s != NULL && s_old->ik.s != NULL
-			&& strcmp(s_old->ck.s, s->ck.s) == 0
-			&& strcmp(s_old->ik.s, s->ik.s) == 0) {
+			&& STR_EQ(s_old->ck, s->ck) && STR_EQ(s_old->ik, s->ik)) {
 		if(s_old->spi_pc && s_old->spi_ps && s_old->port_pc && s_old->port_ps) {
 			LM_INFO("Reusing IPSEC tunnel\n");
 			s->spi_pc = s_old->spi_pc;
@@ -809,6 +822,34 @@ int add_security_server_header(struct sip_msg *m, ipsec_t *s)
 	return 0;
 }
 
+// Free an ipsec_t (the struct and its sec-agree string fields). Used to release
+// the old data.ipsec that gets replaced on the contact at registration, and the
+// request ipsec_t that is not stored on re-registration - both were previously
+// orphaned and leaked.
+static void free_ipsec_data(ipsec_t *p)
+{
+	if(!p) {
+		return;
+	}
+	if(p->ealg.s)
+		shm_free(p->ealg.s);
+	if(p->r_ealg.s)
+		shm_free(p->r_ealg.s);
+	if(p->ck.s)
+		shm_free(p->ck.s);
+	if(p->alg.s)
+		shm_free(p->alg.s);
+	if(p->r_alg.s)
+		shm_free(p->r_alg.s);
+	if(p->ik.s)
+		shm_free(p->ik.s);
+	if(p->prot.s)
+		shm_free(p->prot.s);
+	if(p->mod.s)
+		shm_free(p->mod.s);
+	shm_free(p);
+}
+
 int ipsec_create(struct sip_msg *m, udomain_t *d, int _cflags)
 {
 	pcontact_t *pcontact = NULL;
@@ -820,6 +861,10 @@ int ipsec_create(struct sip_msg *m, udomain_t *d, int _cflags)
 	security_t *req_sec_params = NULL;
 	ipsec_t *s = NULL;
 	ipsec_t *old_s = NULL;
+	// set to 1 once req_sec_params->data.ipsec is handed to the contact (initial
+	// registration); if it stays 0 that ipsec_t was only used to build the
+	// tunnel and must be freed before returning, otherwise it leaks
+	int ipsec_swapped = 0;
 
 	if(m->first_line.type == SIP_REPLY) {
 		t = tmb.t_gett();
@@ -911,7 +956,17 @@ int ipsec_create(struct sip_msg *m, udomain_t *d, int _cflags)
 
 	if(ci.via_port == SIP_PORT) {
 		if(req_sec_params != NULL) {
+			ipsec_t *old_ipsec = pcontact->security_temp->data.ipsec;
 			pcontact->security_temp->data.ipsec = s;
+			// s is now owned by the contact (freed at contact expiry by
+			// free_security()); do not free it on the cleanup path
+			ipsec_swapped = 1;
+			// free the ipsec_t we just replaced on the contact - it was
+			// stored by save_pending() (or a prior ipsec_create()) and was
+			// previously orphaned on every registration
+			if(old_ipsec && old_ipsec != s) {
+				free_ipsec_data(old_ipsec);
+			}
 		}
 		// Update temp security parameters
 		if(ul.update_temp_security(d, pcontact->security_temp->type,
@@ -954,7 +1009,15 @@ int ipsec_create(struct sip_msg *m, udomain_t *d, int _cflags)
 	ret = IPSEC_CMD_SUCCESS; // all good, set ret to SUCCESS, and exit
 
 cleanup:
-	// Do not free str* sec_header! It will be freed in data_lump.c -> free_lump()
+	// On the re-registration path the swap did not happen, so
+	// req_sec_params->data.ipsec was only used to build the tunnel and is never
+	// stored on the contact. Free it here, otherwise it leaks on every
+	// re-registration. On the initial path ipsec_swapped==1 and data.ipsec is
+	// now owned by the contact - do NOT free it.
+	if(req_sec_params && !ipsec_swapped && req_sec_params->data.ipsec) {
+		free_ipsec_data(req_sec_params->data.ipsec);
+		req_sec_params->data.ipsec = NULL;
+	}
 	ul.unlock_udomain(d, &ci.via_host, ci.via_port, ci.via_prot);
 	pkg_free(ci.received_host.s);
 	pkg_free(ci.aor.s);

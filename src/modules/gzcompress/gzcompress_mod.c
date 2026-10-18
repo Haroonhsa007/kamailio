@@ -179,7 +179,7 @@ char *gzc_msg_update(sip_msg_t *msg, unsigned int *olen)
 	init_dest_info(&dst);
 	dst.proto = PROTO_UDP;
 	return build_req_buf_from_sip_req(
-			msg, olen, &dst, BUILD_NO_LOCAL_VIA | BUILD_NO_VIA1_UPDATE);
+			msg, olen, &dst, BUILD_NO_LOCAL_VIA | BUILD_NO_VIA1_UPDATE, NULL);
 }
 
 /**
@@ -221,7 +221,7 @@ int gzc_set_msg_body(sip_msg_t *msg, str *obody, str *nbody)
 }
 
 /* local buffer to use for compressing/decompressing */
-static char _gzc_local_buffer[BUF_SIZE];
+static char _gzc_local_buffer[BUF_SIZE + 1];
 
 /**
  *

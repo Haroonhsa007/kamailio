@@ -38,6 +38,10 @@
 
 #include "srjson.h"
 
+#ifndef SRJSON_NESTING_LIMIT
+#define SRJSON_NESTING_LIMIT 128
+#endif
+
 static const char *ep;
 
 const char *srjson_GetErrorPtr()
@@ -141,10 +145,19 @@ static srjson_t *srjson_New_Item(srjson_doc_t *doc)
 void srjson_Delete(srjson_doc_t *doc, srjson_t *c)
 {
 	srjson_t *next;
+	srjson_t *last;
 	while(c) {
 		next = c->next;
-		if(!(c->type & srjson_IsReference) && c->child)
-			srjson_Delete(doc, c->child);
+		if(!(c->type & srjson_IsReference) && c->child) {
+			/* Splice children into the work list to avoid recursion. */
+			last = c->child;
+			while(last->next)
+				last = last->next;
+			last->next = next;
+			if(next)
+				next->prev = last;
+			next = c->child;
+		}
 		if(!(c->type & srjson_IsReference) && c->valuestring)
 			doc->free_fn(c->valuestring);
 		if(c->string)
@@ -163,6 +176,7 @@ static const char *parse_number(
 {
 	double n = 0, sign = 1, scale = 0;
 	int subscale = 0, signsubscale = 1;
+	int digit;
 
 	/* Could use sscanf for this? */
 	if(*num == '-')
@@ -178,15 +192,21 @@ static const char *parse_number(
 		do
 			n = (n * 10.0) + (*num++ - '0'), scale--;
 		while(*num >= '0' && *num <= '9');
-	}								 /* Fractional part? */
+	} /* Fractional part? */
 	if(*num == 'e' || *num == 'E') { /* Exponent? */
 		num++;
 		if(*num == '+')
 			num++;
 		else if(*num == '-')
 			signsubscale = -1, num++; /* With sign? */
-		while(*num >= '0' && *num <= '9')
-			subscale = (subscale * 10) + (*num++ - '0'); /* Number? */
+		while(*num >= '0' && *num <= '9') {
+			digit = *num++ - '0';
+			/* Saturate, but keep consuming all exponent digits. */
+			if(subscale > (INT_MAX - digit) / 10)
+				subscale = INT_MAX;
+			else
+				subscale = (subscale * 10) + digit; /* Number? */
+		}
 	}
 	n = sign * n * pow(10.0, (scale + subscale * signsubscale)); /* number = +/-
 									 * number.fraction *
@@ -202,8 +222,15 @@ static char *print_number(srjson_doc_t *doc, srjson_t *item)
 {
 	char *str;
 	double d = item->valuedouble;
-	int i = (int)d;
-	if(fabs(((double)i) - d) <= DBL_EPSILON && d <= INT_MAX && d >= INT_MIN) {
+	int i;
+	if(!isfinite(d))
+		return srjson_strdup(doc, "null");
+	if(d <= INT_MAX && d >= INT_MIN) {
+		i = (int)d;
+	} else {
+		i = 0;
+	}
+	if(d <= INT_MAX && d >= INT_MIN && fabs(((double)i) - d) <= DBL_EPSILON) {
 		str = (char *)doc->malloc_fn(21); /* 2^64+1 can be
 							 * represented in 20+1
 							 * chars (including 0-termination). */
@@ -450,13 +477,13 @@ static char *print_string(srjson_doc_t *doc, srjson_t *item)
 
 /* Predeclare these prototypes. */
 static const char *parse_value(
-		srjson_doc_t *doc, srjson_t *item, const char *value);
+		srjson_doc_t *doc, srjson_t *item, const char *value, int depth);
 static char *print_value(srjson_doc_t *doc, srjson_t *item, int depth, int fmt);
 static const char *parse_array(
-		srjson_doc_t *doc, srjson_t *item, const char *value);
+		srjson_doc_t *doc, srjson_t *item, const char *value, int depth);
 static char *print_array(srjson_doc_t *doc, srjson_t *item, int depth, int fmt);
 static const char *parse_object(
-		srjson_doc_t *doc, srjson_t *item, const char *value);
+		srjson_doc_t *doc, srjson_t *item, const char *value, int depth);
 static char *print_object(
 		srjson_doc_t *doc, srjson_t *item, int depth, int fmt);
 
@@ -476,7 +503,7 @@ srjson_t *srjson_Parse(srjson_doc_t *doc, const char *value)
 	if(!c)
 		return 0; /* memory fail */
 
-	if(!parse_value(doc, c, skip(value))) {
+	if(!parse_value(doc, c, skip(value), 0)) {
 		srjson_Delete(doc, c);
 		return 0;
 	}
@@ -496,7 +523,7 @@ char *srjson_PrintUnformatted(srjson_doc_t *doc, srjson_t *item)
 
 /* Parser core - when encountering text, process appropriately. */
 static const char *parse_value(
-		srjson_doc_t *doc, srjson_t *item, const char *value)
+		srjson_doc_t *doc, srjson_t *item, const char *value, int depth)
 {
 	if(!value)
 		return 0; /* Fail on null. */
@@ -522,10 +549,10 @@ static const char *parse_value(
 		return parse_number(doc, item, value);
 	}
 	if(*value == '[') {
-		return parse_array(doc, item, value);
+		return parse_array(doc, item, value, depth);
 	}
 	if(*value == '{') {
-		return parse_object(doc, item, value);
+		return parse_object(doc, item, value, depth);
 	}
 	ep = value;
 	return 0; /* failure. */
@@ -536,6 +563,10 @@ static char *print_value(srjson_doc_t *doc, srjson_t *item, int depth, int fmt)
 {
 	char *out = 0;
 	if(!item)
+		return 0;
+	if(depth >= SRJSON_NESTING_LIMIT
+			&& ((item->type & 255) == srjson_Array
+					|| (item->type & 255) == srjson_Object))
 		return 0;
 	switch((item->type) & 255) {
 		case srjson_NULL:
@@ -565,13 +596,17 @@ static char *print_value(srjson_doc_t *doc, srjson_t *item, int depth, int fmt)
 
 /* Build an array from input text. */
 static const char *parse_array(
-		srjson_doc_t *doc, srjson_t *item, const char *value)
+		srjson_doc_t *doc, srjson_t *item, const char *value, int depth)
 {
 	srjson_t *child;
 	if(*value != '[') {
 		ep = value;
 		return 0;
 	} /* not an array! */
+	if(depth >= SRJSON_NESTING_LIMIT) {
+		ep = value;
+		return 0;
+	}
 	item->type = srjson_Array;
 	value = skip(value + 1);
 	if(*value == ']')
@@ -579,9 +614,10 @@ static const char *parse_array(
 
 	item->child = child = srjson_New_Item(doc);
 	if(!item->child)
-		return 0;										/* memory fail */
-	value = skip(parse_value(doc, child, skip(value))); /* skip any spacing, get
-							 * the value. */
+		return 0; /* memory fail */
+	value = skip(parse_value(
+			doc, child, skip(value), depth + 1)); /* skip any spacing, get
+									 * the value. */
 	if(!value)
 		return 0;
 
@@ -592,7 +628,7 @@ static const char *parse_array(
 		child->next = new_item;
 		new_item->prev = child;
 		child = new_item;
-		value = skip(parse_value(doc, child, skip(value + 1)));
+		value = skip(parse_value(doc, child, skip(value + 1), depth + 1));
 		if(!value)
 			return 0; /* memory fail */
 	}
@@ -610,7 +646,7 @@ static char *print_array(srjson_doc_t *doc, srjson_t *item, int depth, int fmt)
 	char *out = 0, *ptr, *ret;
 	int len = 5;
 	srjson_t *child = item->child;
-	int numentries = 0, i = 0, fail = 0;
+	int numentries = 0, i = 0, fail = 0, j = 0;
 
 	/* How many entries in the array? */
 	while(child)
@@ -622,11 +658,15 @@ static char *print_array(srjson_doc_t *doc, srjson_t *item, int depth, int fmt)
 	memset(entries, 0, numentries * sizeof(char *));
 	/* Retrieve all the results: */
 	child = item->child;
+	depth++;
+	if(fmt) {
+		len += depth; /* indent the ending square bracket */
+	}
 	while(child && !fail) {
-		ret = print_value(doc, child, depth + 1, fmt);
+		ret = print_value(doc, child, depth, fmt);
 		entries[i++] = ret;
 		if(ret)
-			len += strlen(ret) + 2 + (fmt ? 1 : 0);
+			len += strlen(ret) + 2 + (fmt ? 2 + depth : 0);
 		else
 			fail = 1;
 		child = child->next;
@@ -650,19 +690,37 @@ static char *print_array(srjson_doc_t *doc, srjson_t *item, int depth, int fmt)
 	/* Compose the output array. */
 	*out = '[';
 	ptr = out + 1;
+	if(fmt) {
+		*ptr++ = '\n';
+	}
 	*ptr = 0;
 	for(i = 0; i < numentries; i++) {
+		if(fmt) {
+			for(j = 0; j < depth; j++) {
+				*ptr++ = '\t';
+			}
+		}
 		strcpy(ptr, entries[i]);
 		ptr += strlen(entries[i]);
 		if(i != numentries - 1) {
 			*ptr++ = ',';
 			if(fmt)
-				*ptr++ = ' ';
+				*ptr++ = '\n';
 			*ptr = 0;
+		} else {
+			if(fmt) {
+				*ptr++ = '\n';
+				*ptr = 0;
+			}
 		}
 		doc->free_fn(entries[i]);
 	}
 	doc->free_fn(entries);
+	if(fmt) {
+		for(j = 0; j < depth - 1; j++) {
+			*ptr++ = '\t';
+		}
+	}
 	*ptr++ = ']';
 	*ptr++ = 0;
 	return out;
@@ -670,13 +728,17 @@ static char *print_array(srjson_doc_t *doc, srjson_t *item, int depth, int fmt)
 
 /* Build an object from the text. */
 static const char *parse_object(
-		srjson_doc_t *doc, srjson_t *item, const char *value)
+		srjson_doc_t *doc, srjson_t *item, const char *value, int depth)
 {
 	srjson_t *child;
 	if(*value != '{') {
 		ep = value;
 		return 0;
 	} /* not an object! */
+	if(depth >= SRJSON_NESTING_LIMIT) {
+		ep = value;
+		return 0;
+	}
 	item->type = srjson_Object;
 	value = skip(value + 1);
 	if(*value == '}')
@@ -694,9 +756,9 @@ static const char *parse_object(
 		ep = value;
 		return 0;
 	} /* fail! */
-	value = skip(
-			parse_value(doc, child, skip(value + 1))); /* skip any spacing, get
-								 * the value. */
+	value = skip(parse_value(
+			doc, child, skip(value + 1), depth + 1)); /* skip any spacing, get
+									 * the value. */
 	if(!value)
 		return 0;
 
@@ -716,9 +778,9 @@ static const char *parse_object(
 			ep = value;
 			return 0;
 		} /* fail! */
-		value = skip(parse_value(
-				doc, child, skip(value + 1))); /* skip any spacing, get
-									 * the value. */
+		value = skip(parse_value(doc, child, skip(value + 1),
+				depth + 1)); /* skip any spacing, get
+										 * the value. */
 		if(!value)
 			return 0;
 	}

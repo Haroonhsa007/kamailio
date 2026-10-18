@@ -37,6 +37,7 @@
 #include "../../core/events.h"
 #include "../../core/receive.h"
 #include "../../core/str.h"
+#include "../../core/ut.h"
 #include "../../core/tcp_conn.h"
 #include "../../core/tcp_read.h"
 #include "../../core/tcp_server.h"
@@ -198,7 +199,7 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 	else if(frame->payload_len <= USHRT_MAX)
 		extended_length = 2;
 	else if(frame->payload_len < UINT_MAX)
-		extended_length = 4;
+		extended_length = 8;
 	else {
 		LM_ERR(NAME " only supports WebSocket frames with payload "
 					"< %u\n",
@@ -222,6 +223,7 @@ static int encode_and_send_ws_frame(ws_frame_t *frame, conn_close_t conn_close)
 		send_buf[pos++] = (frame->payload_len & 0x00ff) >> 0;
 	} else {
 		send_buf[pos++] = 127;
+		pos += 4; /* 64-bit length, upper 32 bits left zero by memset */
 		send_buf[pos++] = (frame->payload_len & 0xff000000) >> 24;
 		send_buf[pos++] = (frame->payload_len & 0x00ff0000) >> 16;
 		send_buf[pos++] = (frame->payload_len & 0x0000ff00) >> 8;
@@ -796,8 +798,8 @@ static int ws_send_crlf(ws_connection_t *wsc, int opcode)
 
 void ws_keepalive(unsigned int ticks, void *param)
 {
-	int check_time =
-			(int)time(NULL) - cfg_get(websocket, ws_cfg, keepalive_timeout);
+	int check_time = ksr_time_sint(NULL, NULL)
+					 - cfg_get(websocket, ws_cfg, keepalive_timeout);
 
 	ws_connection_id_t *list_head = NULL;
 	ws_connection_t *wsc = NULL;

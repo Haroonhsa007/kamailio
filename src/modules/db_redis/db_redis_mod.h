@@ -25,6 +25,10 @@
 #ifndef _DB_REDIS_MOD_H
 #define _DB_REDIS_MOD_H
 
+#if defined(WITH_HIREDIS_CLUSTER) && defined(WITH_SENTINELS)
+#error "db_redis: WITH_HIREDIS_CLUSTER and WITH_SENTINELS are mutually exclusive"
+#endif
+
 #include "../../lib/srdb1/db.h"
 #include "../../lib/srdb1/db_ut.h"
 #include "../../lib/srdb1/db_query.h"
@@ -51,5 +55,11 @@
 
 extern str redis_keys;
 extern str redis_schema_path;
+extern char *db_redis_db_pass;
+typedef enum
+{
+	MS_SET = 0,
+	MS_HASH = 1
+} mapping_struct_type_t;
 
 #endif /* _DB_REDIS_MOD_H */

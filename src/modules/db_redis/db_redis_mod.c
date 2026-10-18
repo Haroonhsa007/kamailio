@@ -30,18 +30,28 @@
 #include "db_redis_mod.h"
 #include "redis_dbase.h"
 #include "redis_table.h"
+#ifdef WITH_SENTINELS
+#include "redis_sentinels.h"
+#endif
 
 #ifdef WITH_SSL
 int db_redis_opt_tls = 0;
 char *db_redis_ca_path = 0;
 #endif
 char *db_redis_db_pass = 0;
+unsigned int db_redis_max_key_len = 0; /* 0 means disabled */
 
 MODULE_VERSION
 
 str redis_keys = str_init("");
 str redis_schema_path = str_init(SHARE_DIR "db_redis/kamailio");
 int db_redis_verbosity = 1;
+int mapping_struct_type = 0;
+str db_redis_hash_value = str_init("DUMMY");
+
+int db_redis_hash_expires = 0;
+str db_redis_hash_expires_str = str_init("");
+char db_redis_hash_expires_buf[20] = {0};
 
 static int db_redis_bind_api(db_func_t *dbb);
 static int mod_init(void);
@@ -60,6 +70,18 @@ static param_export_t params[] = {
 		{"keys", PARAM_STRING | PARAM_USE_FUNC, (void *)keys_param},
 		{"schema_path", PARAM_STR, &redis_schema_path},
 		{"verbosity", PARAM_INT, &db_redis_verbosity},
+		{"mapping_struct_type", PARAM_INT, &mapping_struct_type},
+		{"max_key_length", PARAM_INT, &db_redis_max_key_len},
+		{"hash_value", PARAM_STRING, &db_redis_hash_value},
+		{"hash_expires", PARAM_INT, &db_redis_hash_expires},
+#ifdef WITH_SENTINELS
+		{"with_sentinels", PARAM_INT, &db_redis_with_sentinels},
+		{"sentinels_config", PARAM_STRING | PARAM_USE_FUNC,
+				(void *)sentinels_param},
+		{"use_replicas", PARAM_INT, &use_replicas}, // 0 master/RW, 1 replica/RO
+		{"redis_master_name", PARAM_STR, &db_redis_master_name},
+		{"recheck_replicas_interval", PARAM_INT, &recheck_replicas_interval},
+#endif
 #ifdef WITH_SSL
 		{"opt_tls", PARAM_INT, &db_redis_opt_tls},
 		{"ca_path", PARAM_STRING, &db_redis_ca_path},
@@ -120,6 +142,24 @@ int mod_register(char *path, int *dlflags, void *p1, void *p2)
 static int mod_init(void)
 {
 	LM_DBG("module initializing\n");
+
+	if(db_redis_hash_expires && (mapping_struct_type != MS_HASH)) {
+		LM_ERR("expires parameter is only supported with mapping_struct_type "
+			   "set to 1 (hash)\n");
+		return -1;
+	}
+
+	if(db_redis_hash_expires) {
+		db_redis_hash_expires_str.s = db_redis_hash_expires_buf;
+		db_redis_hash_expires_str.len = snprintf(
+				db_redis_hash_expires_str.s, 20, "%d", db_redis_hash_expires);
+	}
+
+#ifdef WITH_SENTINELS
+	if(db_redis_sentinels_init_runtime() != 0) {
+		return -1;
+	}
+#endif
 	return 0;
 }
 

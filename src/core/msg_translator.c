@@ -102,6 +102,8 @@
 #include "cfg/cfg.h"
 #include "parser/parse_to.h"
 #include "parser/parse_param.h"
+#include "parser/parser_f.h"
+#include "hash_func.h"
 #include "forward.h"
 #include "str_list.h"
 #include "pvapi.h"
@@ -118,6 +120,8 @@ str _ksr_xavp_via_params = STR_NULL;
 str _ksr_xavp_via_fields = STR_NULL;
 str _ksr_xavp_via_reply_params = STR_NULL;
 int ksr_local_rport = 0;
+str _ksr_via_body_flags = str_init("kvf");
+int ksr_msg_apply_changes_mode = 0;
 
 /** per process fixup function for global_req_flags.
   * It should be called from the configuration framework.
@@ -886,9 +890,13 @@ static inline int lumps_len(
 	}
 
 	for(t = lumps; t; t = t->next) {
-		/* skip if this is an OPT lump and the condition is not satisfied */
-		if((t->op == LUMP_ADD_OPT) && !lump_check_opt(t, msg, send_info))
+		if(t->flags & LUMPFLAG_APPLIED) {
 			continue;
+		}
+		/* skip if this is an OPT lump and the condition is not satisfied */
+		if((t->op == LUMP_ADD_OPT) && !lump_check_opt(t, msg, send_info)) {
+			continue;
+		}
 		for(r = t->before; r; r = r->before) {
 			switch(r->op) {
 				case LUMP_ADD:
@@ -1426,6 +1434,12 @@ void process_lumps(struct sip_msg *msg, struct lump *lumps, char *new_buf,
 	s_offset = *orig_offs;
 
 	for(t = lumps; t; t = t->next) {
+		if(t->flags & LUMPFLAG_APPLIED) {
+			continue;
+		}
+		if(!(flag & FLAG_MSG_DRYRUN)) {
+			t->flags |= LUMPFLAG_APPLIED;
+		}
 		switch(t->op) {
 			case LUMP_ADD:
 			case LUMP_ADD_SUBST:
@@ -1511,17 +1525,17 @@ void process_lumps(struct sip_msg *msg, struct lump *lumps, char *new_buf,
 					break;
 				}
 				size = t->u.offset - s_offset;
-				if(size > 0 && flag == FLAG_MSG_ALL) {
+				if(size > 0 && (flag & FLAG_MSG_ALL)) {
 					memcpy(new_buf + offset, orig + s_offset, size);
 					offset += size;
 					s_offset += size;
-				} else if(flag == FLAG_MSG_LUMPS_ONLY) {
+				} else if(flag & FLAG_MSG_LUMPS_ONLY) {
 					/* do not copy the whole message, jump to the lumps offs */
 					s_offset += size;
 				}
 
 				/* the LUMP_DELs are printed with "- " before them */
-				if(t->op == LUMP_DEL && flag == FLAG_MSG_LUMPS_ONLY) {
+				if(t->op == LUMP_DEL && (flag & FLAG_MSG_LUMPS_ONLY)) {
 					new_buf[offset++] = '-';
 					new_buf[offset++] = ' ';
 				}
@@ -1550,10 +1564,10 @@ void process_lumps(struct sip_msg *msg, struct lump *lumps, char *new_buf,
 				}
 			skip_nop_before:
 				/* process main (del only) */
-				if(t->op == LUMP_DEL && flag == FLAG_MSG_ALL) {
+				if(t->op == LUMP_DEL && (flag & FLAG_MSG_ALL)) {
 					/* skip len bytes from orig msg */
 					s_offset += t->len;
-				} else if(t->op == LUMP_DEL && flag == FLAG_MSG_LUMPS_ONLY) {
+				} else if(t->op == LUMP_DEL && (flag & FLAG_MSG_LUMPS_ONLY)) {
 					/* copy lump value and indent as necessarily */
 					memcpy(new_buf + offset, orig + t->u.offset, t->len);
 					offset += t->len;
@@ -1597,7 +1611,7 @@ void process_lumps(struct sip_msg *msg, struct lump *lumps, char *new_buf,
 	*orig_offs = s_offset;
 
 	/* add '\0' to char* lump list to print it smoothly */
-	if(flag == FLAG_MSG_LUMPS_ONLY) {
+	if(flag & FLAG_MSG_LUMPS_ONLY) {
 		new_buf[offset] = '\0';
 	}
 #undef RCVCOMP_PARAM_ADD
@@ -2111,7 +2125,7 @@ clean:
   */
 char *build_req_buf_from_sip_req(struct sip_msg *msg,
 		unsigned int *returned_len, struct dest_info *send_info,
-		unsigned int mode)
+		unsigned int mode, ksr_msgbuild_t *mbd)
 {
 	unsigned int len, new_len, received_len, rport_len, uri_len, via_len,
 			body_delta;
@@ -2171,7 +2185,7 @@ char *build_req_buf_from_sip_req(struct sip_msg *msg,
 	via_anchor = anchor_lump(msg, msg->via1->hdr.s - buf, 0, HDR_VIA_T);
 	if(unlikely(via_anchor == 0))
 		goto error00;
-	line_buf = create_via_hf(&via_len, msg, send_info, &branch);
+	line_buf = create_via_hf(&via_len, msg, send_info, &branch, mbd);
 	if(unlikely(!line_buf)) {
 		LM_ERR("could not create Via header\n");
 		goto error00;
@@ -2349,7 +2363,7 @@ after_update_via1:
 			new_len -= via_len;
 			if(likely(line_buf))
 				pkg_free(line_buf);
-			line_buf = create_via_hf(&via_len, msg, &di, &branch);
+			line_buf = create_via_hf(&via_len, msg, &di, &branch, mbd);
 			if(!line_buf) {
 				LM_ERR("memory allocation failure!\n");
 				goto error00;
@@ -2401,9 +2415,9 @@ after_update_via1:
 	new_buf[new_len] = 0;
 	/* copy msg adding/removing lumps */
 	process_lumps(msg, msg->add_rm, new_buf, &offset, &s_offset, send_info,
-			FLAG_MSG_ALL);
+			FLAG_MSG_ALL | ((mode & BUILD_DRYRUN) ? FLAG_MSG_DRYRUN : 0));
 	process_lumps(msg, msg->body_lumps, new_buf, &offset, &s_offset, send_info,
-			FLAG_MSG_ALL);
+			FLAG_MSG_ALL | ((mode & BUILD_DRYRUN) ? FLAG_MSG_DRYRUN : 0));
 	/* copy the rest of the message */
 	memcpy(new_buf + offset, buf + s_offset, len - s_offset);
 	new_buf[new_len] = 0;
@@ -2526,10 +2540,10 @@ char *generate_res_buf_from_sip_res(
 	new_buf[new_len] = 0; /* debug: print the message */
 	offset = s_offset = 0;
 	/* note: no send sock*/
-	process_lumps(
-			msg, msg->add_rm, new_buf, &offset, &s_offset, 0, FLAG_MSG_ALL);
-	process_lumps(
-			msg, msg->body_lumps, new_buf, &offset, &s_offset, 0, FLAG_MSG_ALL);
+	process_lumps(msg, msg->add_rm, new_buf, &offset, &s_offset, 0,
+			FLAG_MSG_ALL | ((mode & BUILD_DRYRUN) ? FLAG_MSG_DRYRUN : 0));
+	process_lumps(msg, msg->body_lumps, new_buf, &offset, &s_offset, 0,
+			FLAG_MSG_ALL | ((mode & BUILD_DRYRUN) ? FLAG_MSG_DRYRUN : 0));
 	/* copy the rest of the message */
 	memcpy(new_buf + offset, buf + s_offset, len - s_offset);
 	/* send it! */
@@ -2544,9 +2558,9 @@ error:
 }
 
 char *build_res_buf_from_sip_res(
-		struct sip_msg *msg, unsigned int *returned_len)
+		struct sip_msg *msg, unsigned int *returned_len, unsigned int mode)
 {
-	return generate_res_buf_from_sip_res(msg, returned_len, 0);
+	return generate_res_buf_from_sip_res(msg, returned_len, mode);
 }
 
 char *build_res_buf_from_sip_req(unsigned int code, str *text, str *new_tag,
@@ -2826,7 +2840,7 @@ char *build_res_buf_from_sip_req(unsigned int code, str *text, str *new_tag,
 					/* do nothing, we are interested only in the above headers */
 					;
 		} /* end switch */
-	}	  /* end for */
+	} /* end for */
 	/* lumps */
 	for(lump = msg->reply_lump; lump; lump = lump->next)
 		if(lump->flags & LUMP_RPL_HDR) {
@@ -2890,13 +2904,78 @@ error00:
 }
 
 
+int via_branch_parser(str *vbranch, viabranch_t *vb)
+{
+	char *p;
+	char *n;
+	int scan_space;
+
+	/* we do RFC 3261 tid matching and want to see first if there is
+	 * magic cookie in branch */
+	if(vbranch->len <= MCOOKIE_LEN)
+		goto nomatch;
+	if(memcmp(vbranch->s, MCOOKIE, MCOOKIE_LEN) != 0)
+		goto nomatch;
+
+	vb->cookie.s = vbranch->s;
+	vb->cookie.len = MCOOKIE_LEN;
+
+	p = vbranch->s + MCOOKIE_LEN;
+	scan_space = vbranch->len - MCOOKIE_LEN;
+
+	/* hash_id */
+	n = eat_token2_end(p, p + scan_space, BRANCH_SEPARATOR);
+	vb->shashidx.len = n - p;
+	scan_space -= vb->shashidx.len;
+	if(!vb->shashidx.len || scan_space < 2 || *n != BRANCH_SEPARATOR)
+		goto nomatch;
+	vb->shashidx.s = p;
+	p = n + 1;
+	scan_space--;
+
+	/* md5 value */
+	n = eat_token2_end(p, p + scan_space, BRANCH_SEPARATOR);
+	vb->transid.len = n - p;
+	scan_space -= vb->transid.len;
+	if(n == p || scan_space < 2 || *n != BRANCH_SEPARATOR)
+		goto nomatch;
+	vb->transid.s = p;
+	p = n + 1;
+	scan_space--;
+
+	/* branch id  -  should exceed the scan_space */
+	n = eat_token_end(p, p + scan_space);
+	vb->sbranchidx.len = n - p;
+	if(!vb->sbranchidx.len)
+		goto nomatch;
+	vb->sbranchidx.s = p;
+
+	/* sanity check */
+	if(unlikely(reverse_hex2int(vb->shashidx.s, vb->shashidx.len, &vb->vhashidx)
+						< 0
+				|| vb->vhashidx >= TABLE_ENTRIES
+				|| reverse_hex2int(vb->sbranchidx.s, vb->sbranchidx.len,
+						   &vb->vbranchidx)
+						   < 0
+				|| vb->vbranchidx >= sr_dst_max_branches
+				|| vb->transid.len != MD5_LEN)) {
+		LM_DBG("poor reply ids - hashidx %d branchidx %d transid-len %d/%d\n",
+				vb->vhashidx, vb->vbranchidx, vb->transid.len, MD5_LEN);
+		goto nomatch;
+	}
+	return 0;
+
+nomatch:
+	return -1;
+}
+
 /* return number of chars printed or 0 if space exceeded;
    assumes buffer size of at least MAX_BRANCH_PARAM_LEN
  */
 int branch_builder(unsigned int hash_index,
 		/* only either parameter useful */
-		unsigned int label, char *char_v, int branch, char *branch_str,
-		int *len)
+		unsigned int label, char *char_v, str *xval, int branch,
+		char *branch_str, int *len)
 {
 
 	char *begin;
@@ -2931,6 +3010,20 @@ int branch_builder(unsigned int hash_index,
 	} else { /* ... use the "label" value otherwise */
 		if(int2reverse_hex(&begin, &size, label) == -1)
 			return 0;
+	}
+
+	/* extra value */
+	if(xval != NULL && xval->s != NULL && xval->len > 0
+			&& xval->len <= MAX_BRANCH_XVAL_LEN) {
+		*begin = BRANCH_SEPARATOR;
+		begin++;
+		size--;
+		if(memcpy(begin, xval->s, xval->len)) {
+			begin += xval->len;
+			size -= xval->len;
+		} else {
+			return 0;
+		}
 	}
 
 	if(size) {
@@ -3197,13 +3290,18 @@ char *via_builder(unsigned int *len, sip_msg_t *msg,
 /* creates a via header honoring the protocol of the incoming socket
  * msg is an optional parameter */
 char *create_via_hf(unsigned int *len, struct sip_msg *msg,
-		struct dest_info *send_info /* where to send the reply */, str *branch)
+		struct dest_info *send_info /* where to send the reply */, str *branch,
+		ksr_msgbuild_t *mbd)
 {
 	char *via;
 	str extra_params;
 	struct hostport hp;
 	char sbuf[24];
 	int slen;
+	char vbfbuf[32];
+	int vbflen;
+	flag_t vbfval;
+
 	str xparams;
 #if defined USE_TCP || defined USE_SCTP
 	char *id_buf;
@@ -3320,6 +3418,42 @@ char *create_via_hf(unsigned int *len, struct sip_msg *msg,
 			memcpy(via + extra_params.len + 1, xparams.s, xparams.len - 1);
 			extra_params.s = via;
 			extra_params.len += xparams.len;
+			extra_params.s[extra_params.len] = '\0';
+		}
+	}
+
+	vbfval = 0;
+	if((_ksr_via_body_flags.len > 0)
+			&& ((msg && msg->vbflags) || (mbd && mbd->tvbflags))) {
+		if(msg && msg->vbflags) {
+			vbfval = msg->vbflags;
+		}
+		if(mbd && mbd->tvbflags) {
+			vbfval |= mbd->tvbflags;
+		}
+	}
+	if(vbfval != 0) {
+		vbflen = snprintf(vbfbuf, 32, ";%.*s=%x", _ksr_via_body_flags.len,
+				_ksr_via_body_flags.s, vbfval);
+		if(vbflen <= 0 || vbflen >= 32) {
+			LM_WARN("failed to build via-body flags parameter");
+		} else {
+			via = (char *)pkg_malloc(extra_params.len + vbflen + 1);
+			if(via == 0) {
+				PKG_MEM_ERROR;
+				if(extra_params.s)
+					pkg_free(extra_params.s);
+				return 0;
+			}
+			if(extra_params.s != NULL && extra_params.len > 0) {
+				memcpy(via, extra_params.s, extra_params.len);
+			}
+			if(extra_params.s != NULL) {
+				pkg_free(extra_params.s);
+			}
+			memcpy(via + extra_params.len, vbfbuf, vbflen);
+			extra_params.s = via;
+			extra_params.len += vbflen;
 			extra_params.s[extra_params.len] = '\0';
 		}
 	}
@@ -3574,6 +3708,9 @@ int sip_msg_update_buffer(sip_msg_t *msg, str *obuf)
 	msg->dst_uri = tmp.dst_uri;
 	msg->path_vec = tmp.path_vec;
 
+	memcpy(msg->add_to_branch_s, tmp.add_to_branch_s, MAX_BRANCH_PARAM_LEN);
+	msg->add_to_branch_len = tmp.add_to_branch_len;
+
 	memcpy(msg->buf, obuf->s, obuf->len);
 	msg->len = obuf->len;
 	msg->buf[msg->len] = '\0';
@@ -3613,8 +3750,8 @@ int sip_msg_eval_changes(sip_msg_t *msg, str *obuf)
 				msg, (unsigned int *)&obuf->len, BUILD_NO_VIA1_UPDATE);
 	} else {
 		obuf->s = build_req_buf_from_sip_req(msg, (unsigned int *)&obuf->len,
-				&dst,
-				BUILD_NO_PATH | BUILD_NO_LOCAL_VIA | BUILD_NO_VIA1_UPDATE);
+				&dst, BUILD_NO_PATH | BUILD_NO_LOCAL_VIA | BUILD_NO_VIA1_UPDATE,
+				NULL);
 	}
 	if(obuf->s == NULL) {
 		LM_ERR("couldn't update msg buffer content\n");
@@ -3627,16 +3764,11 @@ int sip_msg_eval_changes(sip_msg_t *msg, str *obuf)
 /**
  *
  */
-int sip_msg_apply_changes(sip_msg_t *msg)
+int sip_msg_apply_changes_now(sip_msg_t *msg)
 {
 	int ret;
 	dest_info_t dst;
 	str obuf;
-
-	if(msg->first_line.type != SIP_REPLY && get_route_type() != REQUEST_ROUTE) {
-		LM_ERR("invalid usage - not in request route or a reply\n");
-		return -1;
-	}
 
 	init_dest_info(&dst);
 	dst.proto = PROTO_UDP;
@@ -3650,8 +3782,8 @@ int sip_msg_apply_changes(sip_msg_t *msg)
 			return -1;
 		}
 		obuf.s = build_req_buf_from_sip_req(msg, (unsigned int *)&obuf.len,
-				&dst,
-				BUILD_NO_PATH | BUILD_NO_LOCAL_VIA | BUILD_NO_VIA1_UPDATE);
+				&dst, BUILD_NO_PATH | BUILD_NO_LOCAL_VIA | BUILD_NO_VIA1_UPDATE,
+				NULL);
 	}
 	if(obuf.s == NULL) {
 		LM_ERR("couldn't update msg buffer content\n");
@@ -3662,4 +3794,16 @@ int sip_msg_apply_changes(sip_msg_t *msg)
 	pkg_free(obuf.s);
 
 	return ret;
+}
+
+/**
+ *
+ */
+int sip_msg_apply_changes(sip_msg_t *msg)
+{
+	if(msg->first_line.type != SIP_REPLY && get_route_type() != REQUEST_ROUTE) {
+		LM_ERR("invalid usage - not in request route or a reply\n");
+		return -1;
+	}
+	return sip_msg_apply_changes_now(msg);
 }

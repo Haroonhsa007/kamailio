@@ -1,6 +1,24 @@
 #
 # control tool for maintaining Kamailio
 #
+# This file is part of Kamailio, a free SIP server.
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Kamailio is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version
+#
+# Kamailio is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+#
 #===================================================================
 
 ##### ----------------------------------------------- #####
@@ -62,14 +80,19 @@ if [ -z "$GDB" ] ; then
 		GDB="$TOOLPATH"
 	fi
 fi
-if [ -z "$MD5" ]; then
-	locate_tool md5sum md5
-	if [ -z "$TOOLPATH" ] ; then
-		# now error, but we can look for alternative names if it is the case
-		echo "error: 'md5sum' or 'md5' tool not found: set MD5 variable to correct tool path"
-		exit
+if [ -z "$CMDHASH" ]; then
+	if [ -z "$MD5" ]; then
+		locate_tool md5sum md5
+		if [ -z "$TOOLPATH" ] ; then
+			# now error, but we can look for alternative names if it is the case
+			echo "error: 'md5sum' or 'md5' tool not found: set CMDHASH variable to correct tool path"
+			exit
+		fi
+		CMDHASH="$TOOLPATH"
+	else
+		# handle old variable setting md5 tool
+		CMDHASH="$MD5"
 	fi
-	MD5="$TOOLPATH"
 fi
 if [ -z "$LAST_LINE" ] ; then
 	locate_tool tail
@@ -777,7 +800,7 @@ filter_json()
 # output: HA1
 _gen_ha1()
 {
-	HA1=`echo -n "$1:$2:$3" | $MD5 | $AWK '{ print $1 }'`
+	HA1=`echo -n "$1:$2:$3" | $CMDHASH | $AWK '{ print $1 }'`
 	if [ $? -ne 0 ] ; then
 		echo "HA1 calculation failed"
 		exit 1
@@ -788,7 +811,7 @@ _gen_ha1()
 # output: HA1B
 _gen_ha1b()
 {
-	HA1B=`echo -n "$1@$2:$2:$3" | $MD5 | $AWK '{ print $1 }'`
+	HA1B=`echo -n "$1@$2:$2:$3" | $CMDHASH | $AWK '{ print $1 }'`
 	if [ $? -ne 0 ] ; then
 		echo "HA1B calculation failed"
 		exit 1
@@ -800,7 +823,7 @@ _gen_ha1b()
 _gen_phplib_id()
 {
 	NOW=`date`;
-	PHPLIB_ID=`echo -n "$1$2:$3:$NOW" | $MD5 | $AWK '{ print $1 }'`
+	PHPLIB_ID=`echo -n "$1$2:$3:$NOW" | $CMDHASH | $AWK '{ print $1 }'`
 }
 
 # params: user, password

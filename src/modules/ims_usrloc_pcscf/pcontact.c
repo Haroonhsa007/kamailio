@@ -114,17 +114,12 @@ void free_ppublic(ppublic_t *_p)
 
 
 // The same piece of code also lives in modules/ims_registrar_pcscf/sec_agree.c
-// Function - parse_sec_agree()
-// goto label - cleanup
+// Function - free_security_t()
 // Keep them in sync!
 void free_security(security_t *_p)
 {
 	if(!_p) {
 		return;
-	}
-
-	if(_p->sec_header.s) {
-		shm_free(_p->sec_header.s);
 	}
 
 	switch(_p->type) {
@@ -264,7 +259,7 @@ int new_pcontact(struct udomain *_d, str *_contact, struct pcontact_info *_ci,
 	(*_c)->aorhash =
 			get_aor_hash(_d, &_ci->via_host, _ci->via_port, _ci->via_prot);
 
-	//setup public ids
+	//set up public ids
 	for(i = 0; i < _ci->num_public_ids; i++) {
 		if(i > 0)
 			is_default =

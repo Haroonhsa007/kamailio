@@ -109,6 +109,49 @@ static int process_sec_agree_param(str name, str value, ipsec_t *ret)
 	return 0;
 }
 
+void free_security_t(security_t *params)
+{
+	if(!params) {
+		return;
+	}
+
+	switch(params->type) {
+		case SECURITY_IPSEC:
+			if(params->data.ipsec) {
+				if(params->data.ipsec->ealg.s)
+					shm_free(params->data.ipsec->ealg.s);
+				if(params->data.ipsec->r_ealg.s)
+					shm_free(params->data.ipsec->r_ealg.s);
+				if(params->data.ipsec->ck.s)
+					shm_free(params->data.ipsec->ck.s);
+				if(params->data.ipsec->alg.s)
+					shm_free(params->data.ipsec->alg.s);
+				if(params->data.ipsec->r_alg.s)
+					shm_free(params->data.ipsec->r_alg.s);
+				if(params->data.ipsec->ik.s)
+					shm_free(params->data.ipsec->ik.s);
+				if(params->data.ipsec->prot.s)
+					shm_free(params->data.ipsec->prot.s);
+				if(params->data.ipsec->mod.s)
+					shm_free(params->data.ipsec->mod.s);
+
+				shm_free(params->data.ipsec);
+			}
+			break;
+
+		case SECURITY_TLS:
+			if(params->data.tls) {
+				shm_free(params->data.tls);
+			}
+			break;
+
+		case SECURITY_NONE:
+			break;
+	}
+
+	shm_free(params);
+}
+
 static security_t *parse_sec_agree(struct hdr_field *h)
 {
 	int i = 0;
@@ -141,14 +184,6 @@ static security_t *parse_sec_agree(struct hdr_field *h)
 		return NULL;
 	}
 	memset(params, 0, sizeof(security_t));
-
-	if((params->sec_header.s = shm_malloc(h->name.len)) == NULL) {
-		SHM_MEM_ERROR_FMT("for security_t sec_header parameter during "
-						  "sec-agree parsing\n");
-		goto cleanup;
-	}
-	memcpy(params->sec_header.s, h->name.s, h->name.len);
-	params->sec_header.len = h->name.len;
 
 	// allocate memory for ipsec_t in security_t
 	params->data.ipsec = shm_malloc(sizeof(ipsec_t));
@@ -217,33 +252,7 @@ cleanup:
 	// The same piece of code also lives in modules/ims_usrloc_pcscf/pcontact.c
 	// Function - free_security()
 	// Keep them in sync!
-	if(params) {
-		if(params->sec_header.s)
-			shm_free(params->sec_header.s);
-		if(params->type == SECURITY_IPSEC && params->data.ipsec) {
-			if(params->data.ipsec->ealg.s)
-				shm_free(params->data.ipsec->ealg.s);
-			if(params->data.ipsec->r_ealg.s)
-				shm_free(params->data.ipsec->r_ealg.s);
-			if(params->data.ipsec->ck.s)
-				shm_free(params->data.ipsec->ck.s);
-			if(params->data.ipsec->alg.s)
-				shm_free(params->data.ipsec->alg.s);
-			if(params->data.ipsec->r_alg.s)
-				shm_free(params->data.ipsec->r_alg.s);
-			if(params->data.ipsec->ik.s)
-				shm_free(params->data.ipsec->ik.s);
-			if(params->data.ipsec->prot.s)
-				shm_free(params->data.ipsec->prot.s);
-			if(params->data.ipsec->mod.s)
-				shm_free(params->data.ipsec->mod.s);
-			shm_free(params->data.ipsec);
-		} else {
-			shm_free(params->data.ipsec);
-		}
-
-		shm_free(params);
-	}
+	free_security_t(params);
 
 	return NULL;
 }

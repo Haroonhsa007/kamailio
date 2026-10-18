@@ -30,6 +30,7 @@
 
 #include <sys/types.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <arpa/nameser.h>
 #include <resolv.h>
 #include <string.h>
@@ -39,7 +40,7 @@
  * On alpine linux musl library it is also not defined. There is no
  * musl feature test macro, so we look for glibc instead.
  */
-#if (defined __GLIBC__ && __GLIBC__ == 2 && __GLIBC_MINOR__ < 25) \
+#if(defined __GLIBC__ && __GLIBC__ == 2 && __GLIBC_MINOR__ < 25) \
 		|| !defined __GLIBC__
 #ifndef T_OPT
 #define T_OPT ns_t_opt
@@ -50,7 +51,9 @@
 #include "compiler_opt.h"
 #include "dprint.h"
 #include "mem/mem.h"
+#include "parser/parse_bytes.h"
 #include "ip_addr.h"
+#include "ut.h"
 #include "error.h"
 #include "globals.h" /* tcp_disable, tls_disable a.s.o */
 #include "cfg_core.h"
@@ -72,6 +75,99 @@ static ip_addr_t *get_next_ipaddr_buf(void)
 	_ksr_ipaddr_list_idx = (_ksr_ipaddr_list_idx + 1) % KSR_IPADDR_LIST_SIZE;
 
 	return ipb;
+}
+
+#define KSR_GETHOSTBYNAME_ADDRS 8
+
+struct hostent *ksr_gethostbyname(const char *name)
+{
+	static struct hostent he;
+	static char *aliases[1];
+	static char *addr_list[KSR_GETHOSTBYNAME_ADDRS + 1];
+	static unsigned char addr_buf[KSR_GETHOSTBYNAME_ADDRS]
+								 [sizeof(struct in6_addr)];
+	static char name_buf[MAX_DNS_NAME];
+	struct addrinfo hints;
+	struct addrinfo *res = NULL;
+	struct addrinfo *ai;
+	const char *hname;
+	int af;
+	int hlen;
+	int i;
+
+	if(name == NULL || *name == '\0') {
+		return NULL;
+	}
+
+	memset(&he, 0, sizeof(he));
+	memset(&hints, 0, sizeof(hints));
+	memset(addr_list, 0, sizeof(addr_list));
+	aliases[0] = NULL;
+
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_flags = AI_ADDRCONFIG;
+
+	if(getaddrinfo(name, NULL, &hints, &res) != 0 || res == NULL) {
+		return NULL;
+	}
+
+	af = AF_UNSPEC;
+	hlen = 0;
+	for(ai = res; ai != NULL; ai = ai->ai_next) {
+		if(ai->ai_family == AF_INET) {
+			af = AF_INET;
+			hlen = sizeof(struct in_addr);
+			break;
+		}
+		if(ai->ai_family == AF_INET6) {
+			af = AF_INET6;
+			hlen = sizeof(struct in6_addr);
+			break;
+		}
+	}
+
+	if(af == AF_UNSPEC) {
+		freeaddrinfo(res);
+		return NULL;
+	}
+
+	i = 0;
+	for(ai = res; ai != NULL && i < KSR_GETHOSTBYNAME_ADDRS; ai = ai->ai_next) {
+		if(ai->ai_family != af || ai->ai_addr == NULL) {
+			continue;
+		}
+		if(af == AF_INET) {
+			memcpy(addr_buf[i], &((struct sockaddr_in *)ai->ai_addr)->sin_addr,
+					hlen);
+		} else {
+			memcpy(addr_buf[i],
+					&((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr, hlen);
+		}
+		addr_list[i] = (char *)addr_buf[i];
+		i++;
+	}
+	addr_list[i] = NULL;
+
+	if(i == 0) {
+		freeaddrinfo(res);
+		return NULL;
+	}
+
+	hname = (res->ai_canonname != NULL && res->ai_canonname[0] != '\0')
+					? res->ai_canonname
+					: name;
+	strncpy(name_buf, hname, sizeof(name_buf) - 1);
+	name_buf[sizeof(name_buf) - 1] = '\0';
+
+	he.h_name = name_buf;
+	he.h_aliases = aliases;
+	he.h_addrtype = af;
+	he.h_length = hlen;
+	he.h_addr_list = addr_list;
+
+	freeaddrinfo(res);
+	return &he;
 }
 
 /* counters framework */
@@ -425,7 +521,6 @@ struct naptr_rdata *dns_naptr_parser(unsigned char *msg, unsigned char *end,
 		PKG_MEM_ERROR;
 		goto error;
 	}
-	naptr->skip_record = 0;
 	naptr->order = ntohs(order);
 	naptr->pref = ntohs(pref);
 
@@ -1118,18 +1213,16 @@ char naptr_get_sip_proto(struct naptr_rdata *n)
 
 	proto = -1;
 
-	if((n->flags_len != 1) || ((*n->flags | 0x20) != 's'))
+	if((n->flags_len != 1)
+			|| (ksr_ascii_lower_u8((unsigned char)*n->flags) != 's'))
 		return -1;
 	if(n->regexp_len != 0)
 		return -1;
 	/* SIP+D2U, SIP+D2T, SIP+D2S, SIPS+D2T */
 	if(n->services_len == 7) { /* SIP+D2X */
-		s = n->services[0] + (n->services[1] << 8) + (n->services[2] << 16)
-			+ (n->services[3] << 24);
-		s |= 0x20202020;
+		s = ksr_ascii_lower_u32(ksr_read_u32le(n->services));
 		if(s == SIP_SCH) {
-			s = n->services[4] + (n->services[5] << 8) + (n->services[6] << 16);
-			s |= 0x00202020;
+			s = ksr_ascii_lower_u24(ksr_read_u24le(n->services + 4));
 			switch(s) {
 				case SIP_D2U:
 					proto = PROTO_UDP;
@@ -1147,13 +1240,9 @@ char naptr_get_sip_proto(struct naptr_rdata *n)
 			return -1;
 		}
 	} else if(n->services_len == 8) { /*SIPS+D2T */
-		s = n->services[0] + (n->services[1] << 8) + (n->services[2] << 16)
-			+ (n->services[3] << 24);
-		s |= 0x20202020;
+		s = ksr_ascii_lower_u32(ksr_read_u32le(n->services));
 		if(s == SIPS_SCH) {
-			s = n->services[4] + (n->services[5] << 8) + (n->services[6] << 16)
-				+ (n->services[7] << 24);
-			s |= 0x20202020;
+			s = ksr_ascii_lower_u32(ksr_read_u32le(n->services + 4));
 			if(s == SIPS_D2T) {
 				proto = PROTO_TLS;
 			}

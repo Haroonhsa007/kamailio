@@ -313,6 +313,7 @@ ADVERTISE	advertise|ADVERTISE
 VIRTUAL		virtual
 STRNAME		name|NAME
 AGNAME		agname|AGNAME
+VRF		vrf|VRF
 ALIAS		alias
 DOMAIN		domain
 SR_AUTO_ALIASES	auto_aliases
@@ -345,6 +346,8 @@ DNS_CACHE_MEM		dns_cache_mem
 DNS_CACHE_GC_INT	dns_cache_gc_interval
 DNS_CACHE_DEL_NONEXP	dns_cache_del_nonexp|dns_cache_delete_nonexpired
 DNS_CACHE_REC_PREF	dns_cache_rec_pref
+DNS_CACHE_MODE		dns_cache_mode
+
 /* ipv6 auto bind */
 AUTO_BIND_IPV6		auto_bind_ipv6
 BIND_IPV6_LINK_LOCAL	bind_ipv6_link_local
@@ -369,10 +372,13 @@ STATS_NAMESEP	stats_name_separator
 MAXBUFFER maxbuffer
 MAXSNDBUFFER maxsndbuffer
 SQL_BUFFER_SIZE sql_buffer_size
+MSG_CLONE_EXTRA_SIZE msg_clone_extra_size
+MSG_APPLY_CHANGES_MODE msg_apply_changes_mode
 MSG_RECV_MAX_SIZE msg_recv_max_size
 TCP_MSG_READ_TIMEOUT tcp_msg_read_timeout
 TCP_MSG_DATA_TIMEOUT tcp_msg_data_timeout
 TCP_ACCEPT_IPLIMIT tcp_accept_iplimit
+TCP_MAIN_THREADS tcp_main_threads
 TCP_CHECK_TIMER tcp_check_timer
 CHILDREN children
 SOCKET socket
@@ -395,6 +401,7 @@ MEMADDSIZE	"mem_add_size"
 MEMJOIN		"mem_join"
 MEMSTATUSMODE		"mem_status_mode"
 CORELOG		"corelog"|"core_log"
+COREPARAM	"coreparam"
 SIP_PARSER_LOG_ONELINE "sip_parser_log_oneline"
 SIP_PARSER_LOG "sip_parser_log"
 SIP_PARSER_MODE "sip_parser_mode"
@@ -438,6 +445,7 @@ TCP_OPT_KEEPIDLE	"tcp_keepidle"
 TCP_OPT_KEEPINTVL	"tcp_keepintvl"
 TCP_OPT_KEEPCNT		"tcp_keepcnt"
 TCP_OPT_CRLF_PING	"tcp_crlf_ping"
+TCP_OPT_LISTEN_BACKLOG	"tcp_listen_backlog"
 TCP_OPT_ACCEPT_NO_CL	"tcp_accept_no_cl"
 TCP_OPT_ACCEPT_HEP3	"tcp_accept_hep3"
 TCP_OPT_ACCEPT_HAPROXY	"tcp_accept_haproxy"
@@ -447,6 +455,7 @@ TCP_CLONE_RCVBUF	"tcp_clone_rcvbuf"
 TCP_REUSE_PORT		"tcp_reuse_port"
 TCP_WAIT_DATA	"tcp_wait_data"
 TCP_SCRIPT_MODE	"tcp_script_mode"
+TLS_CONNECTION_MATCH_DOMAIN "tls_connection_match_domain"
 DISABLE_TLS		"disable_tls"|"tls_disable"
 ENABLE_TLS		"enable_tls"|"tls_enable"
 TLS_THREADS_MODE	"tls_threads_mode"
@@ -777,6 +786,7 @@ IMPORTFILE      "import_file"
 <INITIAL>{VIRTUAL}	{ count(); yylval.strval=yytext; return VIRTUAL; }
 <INITIAL>{STRNAME}	{ count(); yylval.strval=yytext; return STRNAME; }
 <INITIAL>{AGNAME}	{ count(); yylval.strval=yytext; return AGNAME; }
+<INITIAL>{VRF}	{ count(); yylval.strval=yytext; return VRF; }
 <INITIAL>{ALIAS}	{ count(); yylval.strval=yytext; return ALIAS; }
 <INITIAL>{DOMAIN}	{ count(); yylval.strval=yytext; return DOMAIN; }
 <INITIAL>{SR_AUTO_ALIASES}	{ count(); yylval.strval=yytext;
@@ -835,6 +845,8 @@ IMPORTFILE      "import_file"
 								return DNS_CACHE_DEL_NONEXP; }
 <INITIAL>{DNS_CACHE_REC_PREF}	{ count(); yylval.strval=yytext;
 								return DNS_CACHE_REC_PREF; }
+<INITIAL>{DNS_CACHE_MODE}	{ count(); yylval.strval=yytext;
+								return DNS_CACHE_MODE; }
 <INITIAL>{AUTO_BIND_IPV6}	{ count(); yylval.strval=yytext;
 								return AUTO_BIND_IPV6; }
 <INITIAL>{BIND_IPV6_LINK_LOCAL}	{ count(); yylval.strval=yytext;
@@ -866,10 +878,13 @@ IMPORTFILE      "import_file"
 <INITIAL>{MAXBUFFER}	{ count(); yylval.strval=yytext; return MAXBUFFER; }
 <INITIAL>{MAXSNDBUFFER}	{ count(); yylval.strval=yytext; return MAXSNDBUFFER; }
 <INITIAL>{SQL_BUFFER_SIZE}	{ count(); yylval.strval=yytext; return SQL_BUFFER_SIZE; }
+<INITIAL>{MSG_CLONE_EXTRA_SIZE}	{ count(); yylval.strval=yytext; return MSG_CLONE_EXTRA_SIZE; }
+<INITIAL>{MSG_APPLY_CHANGES_MODE}	{ count(); yylval.strval=yytext; return MSG_APPLY_CHANGES_MODE; }
 <INITIAL>{MSG_RECV_MAX_SIZE}	{ count(); yylval.strval=yytext; return MSG_RECV_MAX_SIZE; }
 <INITIAL>{TCP_MSG_READ_TIMEOUT}	{ count(); yylval.strval=yytext; return TCP_MSG_READ_TIMEOUT; }
 <INITIAL>{TCP_MSG_DATA_TIMEOUT}	{ count(); yylval.strval=yytext; return TCP_MSG_DATA_TIMEOUT; }
 <INITIAL>{TCP_ACCEPT_IPLIMIT}	{ count(); yylval.strval=yytext; return TCP_ACCEPT_IPLIMIT; }
+<INITIAL>{TCP_MAIN_THREADS}	{ count(); yylval.strval=yytext; return TCP_MAIN_THREADS; }
 <INITIAL>{TCP_CHECK_TIMER}	{ count(); yylval.strval=yytext; return TCP_CHECK_TIMER; }
 <INITIAL>{CHILDREN}	{ count(); yylval.strval=yytext; return CHILDREN; }
 <INITIAL>{SOCKET}	{ count(); yylval.strval=yytext; return SOCKET; }
@@ -894,6 +909,7 @@ IMPORTFILE      "import_file"
 <INITIAL>{SIP_PARSER_LOG}  { count(); yylval.strval=yytext; return SIP_PARSER_LOG; }
 <INITIAL>{SIP_PARSER_MODE}  { count(); yylval.strval=yytext; return SIP_PARSER_MODE; }
 <INITIAL>{CORELOG}	{ count(); yylval.strval=yytext; return CORELOG; }
+<INITIAL>{COREPARAM}	{ count(); yylval.strval=yytext; return COREPARAM; }
 <INITIAL>{SIP_WARNING}	{ count(); yylval.strval=yytext; return SIP_WARNING; }
 <INITIAL>{USER}		{ count(); yylval.strval=yytext; return USER; }
 <INITIAL>{GROUP}	{ count(); yylval.strval=yytext; return GROUP; }
@@ -957,6 +973,8 @@ IMPORTFILE      "import_file"
 									return TCP_OPT_KEEPCNT; }
 <INITIAL>{TCP_OPT_CRLF_PING}	{ count(); yylval.strval=yytext;
 									return TCP_OPT_CRLF_PING; }
+<INITIAL>{TCP_OPT_LISTEN_BACKLOG}	{ count(); yylval.strval=yytext;
+									return TCP_OPT_LISTEN_BACKLOG; }
 <INITIAL>{TCP_OPT_ACCEPT_NO_CL}	{ count(); yylval.strval=yytext;
 									return TCP_OPT_ACCEPT_NO_CL; }
 <INITIAL>{TCP_OPT_ACCEPT_HEP3}	{ count(); yylval.strval=yytext;
@@ -972,6 +990,8 @@ IMPORTFILE      "import_file"
 <INITIAL>{TCP_WAIT_DATA}	{ count(); yylval.strval=yytext;
 									return TCP_WAIT_DATA; }
 <INITIAL>{TCP_SCRIPT_MODE}	{ count(); yylval.strval=yytext; return TCP_SCRIPT_MODE; }
+<INITIAL>{TLS_CONNECTION_MATCH_DOMAIN}	{ count(); yylval.strval=yytext;
+									return TLS_CONNECTION_MATCH_DOMAIN; }
 <INITIAL>{DISABLE_TLS}	{ count(); yylval.strval=yytext; return DISABLE_TLS; }
 <INITIAL>{ENABLE_TLS}	{ count(); yylval.strval=yytext; return ENABLE_TLS; }
 <INITIAL>{TLS_THREADS_MODE}	{ count(); yylval.strval=yytext; return TLS_THREADS_MODE; }

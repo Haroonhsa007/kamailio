@@ -3,7 +3,7 @@ name: build
 'on':
   push:
     branches:
-      - 6.0
+      - 6.1
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 jobs:
@@ -24,16 +24,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - distribution: bookworm
+          - distribution: trixie
             compilier: gcc
-          - distribution: bookworm
-            compilier: clang
-          - distribution: sid
-            compilier: gcc
-          - distribution: sid
+          - distribution: trixie
             compilier: clang
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: ammaraskar/gcc-problem-matcher@0.3.0
       - name: build
         run: |

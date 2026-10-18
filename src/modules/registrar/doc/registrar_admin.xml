@@ -135,9 +135,11 @@
 		will be used for newly created usrloc records. The parameter contains
 		number of second to expire (for example use 3600 for one hour). If it
 		is set to a lower value than the <quote>min_expires</quote> parameter
-		then it will be ignored. This parameter can be modified via ser config framework.
-		A random value in a specific interval can be selected by using the default_expires_range
-		parameter
+		then see <quote>min_expires_mode</quote> for what happens. If it is
+		greater than <quote>min_expires</quote>, the value is lowered to it.
+		This parameter can be modified via &kamailio; config framework. A
+		random value in a specific interval can be selected by using the
+		default_expires_range parameter.
 		</para>
 		<para>
 		<emphasis>
@@ -171,7 +173,7 @@ modparam("registrar", "default_expires", 1800)
 		<title>Set <varname>default_expires_range</varname> parameter</title>
 		<programlisting format="linespecific">
 ...
-modparam("registrar", "default_expires_range", 30) # +- 30% from default_expires
+modparam("registrar", "default_expires_range", 30) # expires within [0.7*default_expires .. default_expires]
 ...
 </programlisting>
 		</example>
@@ -1209,8 +1211,8 @@ request_route {
 modparam("registrar", "use_expired_contacts", 1)
 ...
 
-kamcmd cfg.set_now_int registrar use_expired_contacts 1
-kamcmd cfg.set_now_int registrar use_expired_contacts 0
+kamctl rpc cfg.set_now_int registrar use_expired_contacts 1
+kamctl rpc cfg.set_now_int registrar use_expired_contacts 0
 		</programlisting>
 		</example>
 	</section>
@@ -1496,6 +1498,11 @@ lookup_branches("location");
 				<emphasis>aor</emphasis> - the address of record.
 				</para>
 			</listitem>
+			<listitem>
+				<para>
+				<emphasis>count</emphasis> - the number of contacts.
+				</para>
+			</listitem>
 			</itemizedlist>
 		</listitem>
 		<listitem>
@@ -1533,9 +1540,9 @@ lookup_branches("location");
 ...
 lookup_xavp("location", "$fu", "rul", "cul");
 xinfo("aor: $xavp(rul=&gt;aor)\n");
-xinfo("number of contacts: $xavp(rul&gt;count)\n");
-xinfo("first contact record - uri: $xavp(cul&gt;uri)\n");
-xinfo("first contact record - socket: $xavp(cul&gt;socket)\n");
+xinfo("number of contacts: $xavp(rul=&gt;count)\n");
+xinfo("first contact record - uri: $xavp(cul=&gt;uri)\n");
+xinfo("first contact record - socket: $xavp(cul=&gt;socket)\n");
 ...
 </programlisting>
 		</example>
@@ -2086,4 +2093,3 @@ if(reg_fetch_contacts("location", "$fu", "caller"))
 	</section>
 
 </chapter>
-

@@ -130,7 +130,6 @@ struct naptr_rdata
 	unsigned char services_len;
 	unsigned char regexp_len;
 	unsigned char repl_len; /* not currently used */
-	unsigned char skip_record;
 
 	char str_table[1]; /* contains all the strings */
 };
@@ -232,6 +231,8 @@ ip_addr_t *str2ip6(str *st);
 ip_addr_t *str2ipx(str *st);
 
 struct hostent *_sip_resolvehost(str *name, unsigned short *port, char *proto);
+/* alternative to gethostbyname() using internally getaddrinfo() */
+struct hostent *ksr_gethostbyname(const char *name);
 
 
 /* gethostbyname wrapper, handles ip/ipv6 automatically */
